@@ -430,23 +430,3 @@ class InMemoryAMASSDatasetSingleFrame(Dataset):
             
         return pose
         
-
-
-if __name__ == "__main__":
-
-    import time
-    import os
-
-    # dataset = AMASSDatasetInterpolate(root_dir="/home/yyf/dataset", num_betas=16, num_dmpls=8, specialize_dir="/ACCAD/Male1Walking_c3d")
-    dataset = AMASSDatasetSingleFrame(root_dir=os.path.expanduser("~/sjtu/dataset/amass"), sample_steps=25, secondary_dir="CMU")
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-    for i, data in enumerate(dataloader):
-        # print(data['poses'].shape)
-        # print(data['trans'].shape)
-        # print(data['betas'].shape)
-        # print(data['fps'].shape)
-        print(data.shape)
-        break
-    # for i, data in enumerate(train_loader):
-    #     print(data.shape)
-    #     break

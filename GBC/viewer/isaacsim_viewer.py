@@ -2,10 +2,7 @@ import time
 import argparse
 
 from isaaclab.app import AppLauncher
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses.pkl"
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses_flipped.pkl"
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/unitree_rt/walk1_subject1.pkl"
-default_pkl = "output/converted_actions/turin_v3/ACCAD/Male2MartialArtsKicks_c3d/G8 -  roundhouse left_poses.pkl"
+default_pkl = ""
 parser = argparse.ArgumentParser(description="Tutorial on using the interactive scene interface.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
 parser.add_argument("--pkl", type=str, default=default_pkl)

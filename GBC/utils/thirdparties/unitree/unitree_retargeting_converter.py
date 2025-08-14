@@ -156,11 +156,3 @@ def export_unitree_rt_to_pkl(
             torch.save(flipped_dict, flipped_save_path)
             print(f"save flipped {name} to {flipped_save_path}")
     
-
-if __name__ == "__main__":
-    dataset_path = "/home/turin/sjtu/dataset/huggingface/LAFAN1_Retargeting_Dataset/h1_2"
-    output_path = "output/h1_2/unitree_rt_60fps"
-    urdf_path = "/home/turin/sjtu/dataset/unitree_ros/robots/h1_2_description/h1_2.urdf"
-    add_flipped_data = True
-    export_unitree_rt_to_pkl(dataset_path, output_path, urdf_path, add_flipped_data=add_flipped_data)
-

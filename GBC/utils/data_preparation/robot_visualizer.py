@@ -235,12 +235,3 @@ class RobotVisualizer:
                 pose=matrix
             ))
 
-
-# if __name__ == "__main__":
-#     from GBC.utils.base.assets import DATA_PATHS
-#     from PIL import Image
-
-#     urdf_path = DATA_PATHS.urdf_path
-#     vis = RobotVisualizer(urdf_path)
-#     q = torch.zeros(vis.num_joints)
-#     Image.fromarray(vis(q)).save("test_vis.png")

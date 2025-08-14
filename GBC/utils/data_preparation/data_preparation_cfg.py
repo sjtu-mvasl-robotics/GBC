@@ -1,5 +1,7 @@
 import sys
 import os
+
+from omegaconf import MISSING
 # PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 # sys.path.append(PROJECT_DIR)
 
@@ -11,17 +13,16 @@ import torch
 @configclass
 class BaseCfg:
     """Base configuration."""
-    smplh_model_path="/home/turin/sjtu/dataset/smplh/male/model.npz"
-    dmpls_model_path="/home/turin/sjtu/dataset/dmpls/male/model.npz"
-    urdf_path="/home/rl/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf"
-    # root_dir='/home/yyf/dataset'
-    device="cuda"
+    smplh_model_path: str = MISSING
+    dmpls_model_path: str = MISSING
+    urdf_path: str = MISSING
+    device: str = "cuda"
 
 
 @configclass
 class AMASSDatasetCfg(BaseCfg):
     """AMASS dataset configuration."""
-    root_dir: str = "/home/turin/sjtu/dataset/amass"
+    root_dir: str = MISSING
     num_betas: int = 16
     num_dmpls: int = 8
     load_hands: bool = False
@@ -50,30 +51,9 @@ class FilterCfg(BaseCfg):
 
 @configclass
 class RobotKinematicsCfg(BaseCfg):
-    mapping_table = {
-        'Pelvis': 'base_link',
-        'L_Hip': 'Link_hip_l_yaw',
-        'R_Hip': 'Link_hip_r_yaw',
-        'L_Knee': 'Link_knee_l_pitch',
-        'R_Knee': 'Link_knee_r_pitch',
-        'L_Ankle': 'Link_ankle_l_pitch',
-        'R_Ankle': 'Link_ankle_r_pitch',
-        'L_Toe': 'Link_ankle_l_roll',
-        'R_Toe': 'Link_ankle_r_roll',
-        'L_Shoulder': 'Link_arm_l_01',
-        'R_Shoulder': 'Link_arm_r_01',
-        'L_Elbow': 'Link_arm_l_04',
-        'R_Elbow': 'Link_arm_r_04',
-        'L_Wrist': 'Link_arm_l_06',
-        'R_Wrist': 'Link_arm_r_06',
-        'Head': 'Link_head_yaw'
-    }
+    mapping_table = MISSING
 
-    offset_map = {
-            'Link_ankle_l_roll': torch.Tensor([0.15, 0, -0.07]),
-            'Link_ankle_r_roll': torch.Tensor([0.15, 0, -0.07]),
-        }
-
+    offset_map = None
     def __init__(self):
         if hasattr(self, 'offset_map'):
             for key, val in self.offset_map.items():
@@ -95,7 +75,7 @@ class BodyModelCfg(BaseCfg):
 
 @configclass
 class PoseRendererCfg(RobotKinematicsCfg, BodyModelCfg, AMASSDatasetCfg):
-    poseformer_model_path: str = "models/15_08_55_epoch_235.pt"
-    save_path: str = "outputs/pose_render"
+    poseformer_model_path: str = MISSING
+    save_path: str = MISSING
     max_single_batch: int = 512
     

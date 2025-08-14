@@ -257,6 +257,15 @@ This project relies on several open-source libraries, each with its own license:
 
 Please see the [licenses](licenses/) directory for the full license text of each dependency.
 
+## Contact Us
+
+If you have any questions or feedback, please feel free to reach out to us!
+
+Mail of the 1st author: [mailto:Yifei Yao](mailto:godchaser@sjtu.edu.cn)
+Mail of the corresponding author: [mailto:Jun-Guo Lu](mailto:jglu@sjtu.edu.cn)
+
+If you want to contact our laboratory for more information, it is recommended to reach out to the corresponding author. For technical inquiries, please contact the 1st author.
+
 ## Citation
 
 If you find GBC useful in your research, please consider citing our paper:

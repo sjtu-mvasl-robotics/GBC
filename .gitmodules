@@ -1,0 +1,3 @@
+[submodule "dependencies/rsl_rl"]
+	path = dependencies/rsl_rl
+	url = git@github.com:sjtu-mvasl-robotics/rsl_rl.git

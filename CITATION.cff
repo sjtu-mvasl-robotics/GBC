@@ -1,0 +1,53 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Yao"
+    given-names: "Yifei"
+    affiliation: "Shanghai Jiao Tong University"
+  - family-names: "Luo"
+    given-names: "Chengyuan"
+    affiliation: "Shanghai Jiao Tong University"
+  - family-names: "Du"
+    given-names: "Jiaheng"
+    affiliation: "Shanghai Jiao Tong University"
+  - family-names: "He"
+    given-names: "Wentao"
+    affiliation: "Shanghai Jiao Tong University"
+  - family-names: "Lu"
+    given-names: "Jun-Guo"
+    affiliation: "Shanghai Jiao Tong University"
+title: "GBC: Generalized Behavior-Cloning Framework for Whole-Body Humanoid Imitation"
+date-released: 2025-08-14
+url: "https://github.com/sjtu-mvasl-robotics/GBC"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: "Yao"
+      given-names: "Yifei"
+      affiliation: "Shanghai Jiao Tong University"
+    - family-names: "Luo"
+      given-names: "Chengyuan"
+      affiliation: "Shanghai Jiao Tong University"
+    - family-names: "Du"
+      given-names: "Jiaheng"
+      affiliation: "Shanghai Jiao Tong University"
+    - family-names: "He"
+      given-names: "Wentao"
+      affiliation: "Shanghai Jiao Tong University"
+    - family-names: "Lu"
+      given-names: "Jun-Guo"
+      affiliation: "Shanghai Jiao Tong University"
+  title: "GBC: Generalized Behavior-Cloning Framework for Whole-Body Humanoid Imitation"
+  year: 2025
+  doi: ""
+  journal: "arXiv"
+  url: "https://arxiv.org/abs/2508.09960"
+  identifiers:
+    - type: "arxiv"
+      value: "2508.09960"
+  keywords:
+    - "behavior cloning"
+    - "humanoid robotics"
+    - "imitation learning"
+    - "reinforcement learning"
+    - "motion retargeting"

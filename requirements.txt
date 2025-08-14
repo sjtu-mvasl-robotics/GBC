@@ -1,0 +1,21 @@
+matplotlib
+networkx
+numpy==1.26.4
+open3d
+opencv_python
+Pillow
+pyrender==0.1.45
+pytorch_kinematics
+scipy
+smplx
+# torch
+tqdm
+trimesh
+urdf_parser_py==0.0.4
+warp-lang
+roma==1.5.3
+# xformers
+
+# The following dependencies require special installation steps:
+# human_body_prior - Install with: git clone https://github.com/nghorbani/human_body_prior.git && cd human_body_prior && python setup.py develop
+# body_visualizer - Install with: git clone https://github.com/nghorbani/body_visualizer.git && cd body_visualizer && sed -i 's/[><=!]*[0-9][0-9.]*[0-9]*//g' requirements.txt && python setup.py develop

@@ -668,10 +668,10 @@ class AMASSActionConverter:
 
                 # import time
                 # t_begin = time.time()
-                start, end, seq_len, dist = find_longest_cyclic_subsequence(actions_filtered, max_distance=0.15)
+                start, end, seq_len, dist = find_longest_cyclic_subsequence(actions_filtered, max_distance=0.25)
                 # print(f'find_longest_cyclic_subsequence time: {time.time() - t_begin} for sequence {fname} with length {actions_filtered.shape[0]}')
                 # print("sequence dist is: ", dist)
-                if seq_len < min_subseq_ratio * actions_filtered.shape[0]  or seq_len < 30 or dist > 0.15:
+                if seq_len < min_subseq_ratio * actions_filtered.shape[0]  or seq_len < 50 or dist > 0.25:
                     # print(f"Cyclic subsequence not found for {fname}")
                     cyclic_subseq = None
                 else:

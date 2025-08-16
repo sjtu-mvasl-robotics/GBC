@@ -368,6 +368,10 @@ class AMASSActionConverter:
         self.fk = RobotKinematics(cfg.urdf_path, device=cfg.device)
         self.model = PoseTransformer(num_actions=self.fk.num_dofs, load_hands=cfg.load_hands).to(cfg.device)
         self.model.load_state_dict(torch.load(cfg.pose_transformer_path, map_location=torch.device(cfg.device),weights_only=False))
+        jit_compile = kwargs.get("jit_compile", False)
+        if jit_compile:
+            self.model = torch.jit.trace(self.model, torch.zeros((1, 63 if not cfg.load_hands else 153), device=cfg.device))
+        self.model.eval() # set model to evaluation mode to improve performance
         self.post_process = TrackingDataPostProcess(filter_cfg=cfg.filter).to(cfg.device)
         self.batch_size = cfg.batch_size
         self.device = cfg.device

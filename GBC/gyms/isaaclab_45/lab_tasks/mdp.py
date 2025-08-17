@@ -647,8 +647,8 @@ def external_z_force_base(
     forces = torch.zeros((len(env_ids), len(asset_cfg.body_ids), 3), device=env.device)
     forces[:, :, 2] = z_force.unsqueeze(1).repeat(1, len(asset_cfg.body_ids))
 
-    tf_mat = matrix_from_quat(root_states[:, 3:7]).transpose(1, 2)
-    forces = torch.einsum("ijk, ilk -> ilj", tf_mat, forces)
+    tf_mat = matrix_from_quat(root_states[:, 3:7])
+    forces = torch.einsum("ijk, ikl -> ijl", tf_mat, forces)
 
     torque = torch.zeros_like(forces)
     asset.set_external_force_and_torque(forces=forces, torques=torque, body_ids=asset_cfg.body_ids, env_ids=env_ids)

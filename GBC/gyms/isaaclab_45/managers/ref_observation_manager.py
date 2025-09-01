@@ -377,7 +377,15 @@ class RefObservationManager(ManagerBase):
         if self._group_ref_obs_term_buffer_manager[group_name] is None:
             self._group_ref_obs_term_buffer_manager[group_name] = BufferManager(self.num_envs, len(self.tmp_storage), self.cfg.working_mode, self.device)
             self._group_ref_obs_term_buffer_manager[group_name].set_all_env_ref_id(self.file_indices)
-        
+            for idx in range(len(self.tmp_storage)):
+                pkl = self.tmp_storage[idx]
+                z = pkl["trans"][0, 2]
+                self._group_ref_obs_term_buffer_manager[group_name].set_env_origin_z(idx, z)
+                self._group_ref_obs_term_buffer_manager[group_name].add_reference('trans', idx, pkl["trans"], False, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
+                self._group_ref_obs_term_buffer_manager[group_name].add_reference('root_orient', idx, pkl["root_orient"], False, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
+            self._group_ref_obs_term_buffer_manager[group_name].prepare_buffers('trans')
+            self._group_ref_obs_term_buffer_manager[group_name].prepare_buffers('root_orient')
+
         self._group_ref_obs_init_delay[group_name].append(term_cfg.load_seq_delay)
 
         if term_cfg.is_base_pose:

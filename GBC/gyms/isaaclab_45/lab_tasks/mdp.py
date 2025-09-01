@@ -18,6 +18,11 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     ObsTerm,
 )
 
+import carb
+import isaaclab.sim as sim_utils
+import omni.physics.tensors.impl.api as physx
+
+
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationTermCfg as RefObsTerm
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationCfg as RefObsCfg
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationGroupCfg as RefObsGroup
@@ -152,6 +157,34 @@ def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.
     if ref_phase is not None:
         phase = torch.where(mask.unsqueeze(1), ref_phase, phase)
     return phase
+
+
+###################################################################################################
+
+# Done Terms
+
+###################################################################################################
+
+def root_height_below_minimum_with_reference(
+    env: ManagerBasedRLEnv, minimum_height: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Terminate when the asset's root height is below the minimum height.
+
+    Note:
+        This is currently only supported for flat terrains, i.e. the minimum height is in the world frame.
+    """
+    # extract the used quantities (to enable type-hinting)
+    asset = env.scene[asset_cfg.name]
+    if not hasattr(env, 'ref_observation_manager'):
+        return asset.data.root_pos_w[:, 2] < minimum_height
+    
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    
+    target_height = target[..., 2]
+    target_min_height = torch.clamp(target_height - 0.5, min=0.0)
+    target_min_height[~mask] = minimum_height
+
+    return asset.data.root_pos_w[:, 2] < target_min_height
     
 
 ###################################################################################################
@@ -542,6 +575,82 @@ def reset_joints_by_start_time(
 
 ###################################################################################################
 
+
+class ExternalGravityUpdater:
+    def __init__(self):
+        self.history_base_contact = deque(maxlen=320)
+        self.history_episode_length = deque(maxlen=320)
+        self.last_update_cnt = 0
+
+    def add_base_contact_val(self, val):
+        self.history_base_contact.append(val)
+
+    def add_episode_length_val(self, val):
+        self.history_episode_length.append(val)
+
+    def get_base_contact_avg(self):
+        return sum(self.history_base_contact) / len(self.history_base_contact)
+    
+    def get_episode_length_avg(self):
+        return sum(self.history_episode_length) / len(self.history_episode_length)
+
+    def update_external_gravity_base(self, current_overrides: dict, new_kwargs: dict) -> dict:
+        env = new_kwargs["env"]
+        
+        # fill your update strategy here
+        gravity_offset_ratio = new_kwargs["gravity_offset_ratio"]
+        if "gravity_offset_ratio" in current_overrides:
+            gravity_offset_ratio = current_overrides["gravity_offset_ratio"]
+
+        base_contact = env.unwrapped.extras["log"]["Episode_Termination/base_contact"]
+        episode_length = env.unwrapped.extras["log"]["Episode_Reward/survival"]
+        self.add_base_contact_val(base_contact)
+        self.add_episode_length_val(episode_length)
+        base_contact = self.get_base_contact_avg()
+        episode_length = self.get_episode_length_avg()
+        self.last_update_cnt += 1
+
+        update_threshold = new_kwargs["update_threshold"]
+        update_ratio = new_kwargs["update_ratio"]
+        offset_bound = new_kwargs["apply_offset_range_bound"]
+        update_interval = new_kwargs["update_interval"]
+
+        if self.last_update_cnt >= update_interval:
+            # if base_contact < update_threshold:
+            if episode_length > update_threshold:
+                gravity_offset_ratio *= update_ratio
+            
+            if gravity_offset_ratio > offset_bound[1]:
+                gravity_offset_ratio = offset_bound[1]
+            if gravity_offset_ratio < offset_bound[0]:
+                gravity_offset_ratio = offset_bound[0]
+
+            print("Current gravity_offset_ratio:", gravity_offset_ratio)
+            print("Current base_contact avg:", base_contact)
+            self.last_update_cnt = 0
+
+        current_overrides["gravity_offset_ratio"] = gravity_offset_ratio
+        return current_overrides
+    
+@update(update_strategy=ExternalGravityUpdater().update_external_gravity_base)
+def external_gravity_base(
+    env: ManagerBasedRLEnv, 
+    env_ids: torch.Tensor,
+    gravity_offset_ratio: float = 1.0,
+    update_threshold: float = 1.1,
+    update_ratio: float = 1.05,
+    update_interval: int = 320,
+    apply_offset_range_bound: tuple[float] = (0.05, 1.0), # minimal of 5% gravity, aka 0.05 * 9.81 m/s^2
+):
+    """Apply gravity multiplier to the base of the robot."""
+    gravity = torch.tensor(env.sim.cfg.gravity, device="cpu").unsqueeze(0)
+    gravity = gravity * gravity_offset_ratio
+    gravity = gravity[0].tolist()
+
+    physics_sim_view: physx.SimulationView = sim_utils.SimulationContext.instance().physics_sim_view
+    physics_sim_view.set_gravity(carb.Float3(*gravity))
+
+
 class ExternalForceUpdater:
     def __init__(self):
         self.history_base_contact = deque(maxlen=320)
@@ -648,7 +757,7 @@ def external_z_force_base(
     forces[:, :, 2] = z_force.unsqueeze(1).repeat(1, len(asset_cfg.body_ids))
 
     tf_mat = matrix_from_quat(root_states[:, 3:7])
-    forces = torch.einsum("ijk, ikl -> ijl", tf_mat, forces)
+    forces = torch.einsum("ijk, ilk -> ilj", tf_mat, forces)
 
     torque = torch.zeros_like(forces)
     asset.set_external_force_and_torque(forces=forces, torques=torque, body_ids=asset_cfg.body_ids, env_ids=env_ids)

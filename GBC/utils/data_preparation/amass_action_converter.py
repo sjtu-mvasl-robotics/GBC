@@ -2,10 +2,12 @@ from GBC.utils.data_preparation.pose_transformer import PoseTransformer
 from GBC.utils.data_preparation.amass_loader import AMASSDatasetInterpolate
 import os
 import torch
+import torch.nn.functional as F
 from GBC.utils.data_preparation.data_preparation_cfg import *
 from torchaudio_filters import LowPass
 from tqdm import tqdm
-from GBC.utils.base.math_utils import rot_mat_to_vec, rot_vec_to_mat, quaternion_to_angle_axis, find_longest_cyclic_subsequence, angle_axis_to_quaternion, batch_angle_axis_to_ypr, interpolate_trans, pad_to_len, filt_feet_contact, hampel_filter, quat_inv, quat_conjugate, quat_rotate, q_mul, quat_rotate_inverse, quat_fix, unwrap_and_smooth_rot_vecs
+from GBC.utils.base.math_utils import rot_mat_to_vec, rot_vec_to_mat, quaternion_to_angle_axis, find_longest_cyclic_subsequence, angle_axis_to_quaternion, batch_angle_axis_to_ypr, interpolate_trans, pad_to_len, filt_feet_contact, hampel_filter, quat_inv, quat_conjugate, quat_rotate, q_mul, quat_rotate_inverse, quat_fix, unwrap_and_smooth_rot_vecs, smooth_quat_savgol
+from GBC.utils.base.rotation_repair import repair_rotation_sequence
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import numpy as np
@@ -127,15 +129,9 @@ o be adjusted (T, 3)
         root_orient = rot_mat_to_vec(rot)
         root_quat = angle_axis_to_quaternion(root_orient)
         root_quat = quat_fix(root_quat)  # Ensure quaternion is continuous
+        root_quat = smooth_quat_savgol(root_quat, window_size=11, polyorder=3)
+        root_quat = F.normalize(root_quat, p=2, dim=1)
         root_orient = quaternion_to_angle_axis(root_quat)
-        
-        root_orient = unwrap_and_smooth_rot_vecs(root_orient, smoothing_window=5)
-        # root_orient = rot_vec_repair_by_slerp(root_orient)
-        # root_orient, _ = hampel_filter(root_orient, window_size=5)
-        # root_orient = rot_vec_angular_velocity_filter(root_orient)
-        # root_orient = self.filt(root_orient, window_size=5)
-        # continuousity fix
-        
         
         return root_orient
     
@@ -245,7 +241,9 @@ o be adjusted (T, 3)
 
     def transform_poses_data(self, save_dict, filter_pose):
         if filter_pose:
-            trans, root_orient = map(self.filt, (save_dict["trans"], save_dict["root_orient"]))
+            # trans, root_orient = map(self.filt, (save_dict["trans"], save_dict["root_orient"]))
+            trans = self.filt(save_dict["trans"])
+            root_orient = save_dict["root_orient"]
         else:
             trans, root_orient = save_dict["trans"], save_dict["root_orient"]
         new_trans, new_root_orient = self.transform_for_intial_pose(trans, root_orient)
@@ -264,15 +262,6 @@ o be adjusted (T, 3)
         return self.filt(lin_vel), lin_vel
 
     def calc_ang_vel_world(self, rot_vec, fps):
-        # rot_vec = self.make_angles_continuous(rot_vec)
-        
-        # rot_mat = rot_vec_to_mat(rot_vec)
-        # rot_mat_inv = rot_mat[:-1, ...].permute(0, 2, 1)
-        # rot_diff_mat = torch.bmm(rot_mat_inv, rot_mat[1:, ...])
-        # rot_diff_vec_local = rot_mat_to_vec(rot_diff_mat)
-        # # rot_diff_vec = torch.einsum("ijk, ik -> ij", rot_mat[:-1, ...], rot_diff_vec_local)
-        # rot_diff_vec = torch.cat([rot_diff_vec, rot_diff_vec[-1:]], dim=0)
-        # ang_vel = rot_diff_vec * fps
         rot_quat = angle_axis_to_quaternion(rot_vec)
         # rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
         # rot_quat = self.filt(rot_quat)
@@ -287,7 +276,7 @@ o be adjusted (T, 3)
         ang_vel = rot_diff_vec * fps
         ang_vel = torch.cat([ang_vel, ang_vel[-1:]], dim=0)
 
-        return self.filt(ang_vel)
+        return ang_vel
 
     def calc_ang_vel(self, rot_vec, fps):
         rot_quat = angle_axis_to_quaternion(rot_vec)
@@ -306,7 +295,7 @@ o be adjusted (T, 3)
         # ang_vel = quat_rotate(quat_inv(rot_quat), ang_vel)
         ang_vel = quat_rotate_inverse(rot_quat, ang_vel) # (T, 3)
 
-        return self.filt(ang_vel)
+        return ang_vel
     
     def calc_lin_vel_world(self, trans, orient, fps):
         lin_vel = torch.diff(trans, dim=0) # (T-1, 3)
@@ -320,7 +309,9 @@ o be adjusted (T, 3)
         lin_vel = torch.cat([lin_vel, lin_vel[-1:]], dim=0) # (T, 3)
         rot_quat = angle_axis_to_quaternion(orient)
         rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
-        rot_quat = self.filt(rot_quat)
+        rot_quat = smooth_quat_savgol(rot_quat, window_size=11, polyorder=3)
+        rot_quat = F.normalize(rot_quat, p=2, dim=1)
+        
         lin_vel = quat_rotate_inverse(rot_quat, lin_vel) # (T,
         return lin_vel
 
@@ -395,7 +386,6 @@ class AMASSActionConverter:
     @classmethod
     def from_cfg(cls, cfg: BaseCfg):
         return cls(cfg)
-    
     @torch.no_grad()
     def pose_to_action(self, pose: torch.Tensor):
         '''
@@ -452,7 +442,7 @@ class AMASSActionConverter:
             "root_orient": poses[:, :3],
         }
         positions = self.body_model(**body_parms).Jtr.detach()
-        height = positions[:, :, 1] # for AMASS, the y-axis is up
+        height = positions[:, :, 1]
         trans[:, 1] -= height.min()
         return trans
     
@@ -656,6 +646,8 @@ class AMASSActionConverter:
                     trans = trans.unsqueeze(0)
                 root_orient = poses[:, :3].to(self.device) # Rotation vector (T, 3)
                 root_orient = self.post_process.adjust_root_orient(root_orient)
+                
+                # self.test_pose_to_action_fps() # Test the pose to action conversion FPS
 
                 # ensure trans & root_orient has same shape[0] as poses
                 trans = adjust_shape_0(trans, poses.shape[0])
@@ -668,10 +660,10 @@ class AMASSActionConverter:
 
                 # import time
                 # t_begin = time.time()
-                start, end, seq_len, dist = find_longest_cyclic_subsequence(actions_filtered, max_distance=0.25)
+                start, end, seq_len, dist = find_longest_cyclic_subsequence(actions_filtered, max_distance=0.15)
                 # print(f'find_longest_cyclic_subsequence time: {time.time() - t_begin} for sequence {fname} with length {actions_filtered.shape[0]}')
                 # print("sequence dist is: ", dist)
-                if seq_len < min_subseq_ratio * actions_filtered.shape[0]  or seq_len < 50 or dist > 0.25:
+                if seq_len < min_subseq_ratio * actions_filtered.shape[0] or dist > 0.15:
                     # print(f"Cyclic subsequence not found for {fname}")
                     cyclic_subseq = None
                 else:
@@ -709,6 +701,8 @@ class AMASSActionConverter:
                     disable_height=True,
                     debug_save_dir=export_path,
                 )
+                
+                filtered_root_poses = self.post_process.filt(filtered_root_poses.squeeze(0))
 
                 save_dict["trans"] = filtered_root_poses.squeeze(0)
                 

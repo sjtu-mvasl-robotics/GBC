@@ -2,7 +2,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 class StdUpdater:
-    def __init__(self, std_list, reward_key, reward_threshold=0.8, reward_hist=128, step_threshold_down=32*1200, step_threshold_up=32*300):
+    def __init__(self, std_list, reward_key, reward_threshold=0.8, reward_hist=128, step_threshold_down=32*1200, step_threshold_up=32*200):
         self.std_list = std_list
         self.reward_key = reward_key
         self.level = 0
@@ -14,7 +14,7 @@ class StdUpdater:
         self.reward_buf = torch.ones(self.reward_hist, dtype=torch.float64) * -1e9
         self.reward_pos_id = 0
 
-    def update(self, env: ManagerBasedRLEnv):
+    def update(self, env: ManagerBasedRLEnv, bidirect=False):
         reward = env.extras["log"][f"Episode_Reward/{self.reward_key}"]
         try:
             reward_weight = env.reward_manager._term_cfgs[env.reward_manager.active_terms.index(self.reward_key)].weight
@@ -32,11 +32,12 @@ class StdUpdater:
                 self.level += 1
                 changed = True
         elif (env.common_step_counter - self.step_num_last_change > self.step_threshold_down and 
-              reward < self.reward_threshold):
+              reward < self.reward_threshold * 0.5 and bidirect):
             if self.level > 0:
                 self.level -= 1
                 changed = True
         if changed:
             self.step_num_last_change = env.common_step_counter
             print(f"Updated {self.reward_key} level to {self.level}")
+        env.extras["log"][f"Curriculum/{self.reward_key}_std"] = self.std_list[self.level]
         return self.std_list[self.level]

@@ -11,7 +11,11 @@ class RslRlRefPpoActorCriticCfg:
     dim_model: int = MISSING
     num_layers: int = MISSING
     num_heads: int = MISSING
+    num_steps_per_env: int = MISSING
     init_noise_std: float = MISSING
+    max_seq_len: int = 24
+    mlp_hidden_dims: list[int] = []
+    apply_rope: bool = True
     load_dagger: bool = False
     load_dagger_path: str | None = None
     load_actor_path: str | None = None

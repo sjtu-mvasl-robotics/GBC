@@ -1848,6 +1848,7 @@ def unwrap_angle(angles: torch.Tensor, period: float = 2 * np.pi) -> torch.Tenso
     unwrapped = angles.clone()
     # Compute the difference between adjacent angles
     diff = torch.diff(angles)
+
     #   # Detect jumps in the angle sequence
     # From ~2pi to ~0 (diff < -pi)
     jumps_up = diff < -period / 2
@@ -1858,6 +1859,7 @@ def unwrap_angle(angles: torch.Tensor, period: float = 2 * np.pi) -> torch.Tenso
     corrections = torch.zeros_like(angles)
     corrections[1:] += torch.cumsum(jumps_up.to(angles.dtype), dim=0) * period
     corrections[1:] -= torch.cumsum(jumps_down.to(angles.dtype), dim=0) * period
+
     return unwrapped + corrections
 
 
@@ -1865,6 +1867,7 @@ def unwrap_angle(angles: torch.Tensor, period: float = 2 * np.pi) -> torch.Tenso
 def simple_moving_average(x: torch.Tensor, window_size: int) -> torch.Tensor:
     """
     Apply moving average to 2D tensors
+
     Args:
         x (torch.Tensor): input tensor (T, D), where T is the sequence length and D is the number of features.
         window_size (int): Size of the moving average window.
@@ -1874,15 +1877,19 @@ def simple_moving_average(x: torch.Tensor, window_size: int) -> torch.Tensor:
     """
     if window_size <= 1:
         return x
-    
+
     T, D = x.shape
+
     x_reshaped = x.t().unsqueeze(0)
 
     weight = torch.ones(D, 1, window_size, device=x.device, dtype=x.dtype) / window_size
 
     padding = window_size // 2
+
     smoothed_reshaped = torch.nn.functional.conv1d(x_reshaped, weight, padding=padding, groups=D)
+
     return smoothed_reshaped.squeeze(0).t()
+
 
 @torch.jit.script
 def unwrap_and_smooth_rot_vecs(rot_vecs: torch.Tensor, smoothing_window: int = 5) -> torch.Tensor:
@@ -2031,20 +2038,26 @@ def is_foot_parallel_from_rot_matrix(rot_mat_batch: torch.Tensor, tolerance_deg:
     """
     device = rot_mat_batch.device
     dtype = rot_mat_batch.dtype
+
     # --- 1. Define Base Vector ---
     foot_local_normal = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+
     # --- 2. Rotate the Foot's Normal Vector ---
     foot_world_normal = torch.matmul(rot_mat_batch, foot_local_normal.view(1, 1, 3, 1)).squeeze(-1)
+
     # --- 3. Get the Dot Product ---
     # The dot product with the world's up-vector [0,0,1] is simply the Z-component.
     dot_product = foot_world_normal[..., 2]
+
     # --- 4. Compare Cosines Directly (Optimization) ---
     # Pre-calculate the cosine of the tolerance angle.
     # We only need to do this once.
     tolerance_rad = torch.deg2rad(torch.tensor(tolerance_deg, device=device, dtype=dtype))
     cos_tolerance = torch.cos(tolerance_rad)
+
     # Check if the absolute value of the dot product is greater than or equal to the cosine threshold.
     # This is mathematically equivalent to checking if the angle is close to 0 OR 180 degrees,
     # but is computationally much cheaper than using acos.
     is_parallel = torch.abs(dot_product) >= cos_tolerance
+
     return is_parallel

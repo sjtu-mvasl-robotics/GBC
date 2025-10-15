@@ -33,6 +33,11 @@ class ReferenceObservationTermCfg(ManagerTermBaseCfg):
     in_obs_tensor = True
     is_constant = False
     is_base_pose: bool = False
+
+    env_func: Callable | None = None
+    """A function to retrieve the term directly from the environment."""
+    env_func_params: dict[str, Any] = {}
+    """The parameters for the env_func."""
     
     load_seq_delay: float = 0.0
     """Delay for loading the sequence data. Unit is in seconds. Defaults to 0.0."""

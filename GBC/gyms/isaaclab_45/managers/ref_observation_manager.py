@@ -33,6 +33,7 @@ import numpy as np
 
 ref_obs_type = tuple[torch.Tensor, torch.Tensor] | None
 
+
 class RefObservationManager(ManagerBase):
     def __init__(self, cfg: ReferenceObservationCfg, env: ManagerBasedEnv):
         assert cfg is not None, "The Configuration for RefObservationManager shouldn't be empty (in order to call _prepare_terms())"
@@ -154,16 +155,16 @@ class RefObservationManager(ManagerBase):
         return (symmetry_ref_observations, ref_masks)
 
     def _compute_policy_term_idx(self, term_name: str) -> tuple[int, int]:
-        group_term_names = self._group_ref_obs_term_names["policy"]
-        group_term_concatenate_last_dim = copy.deepcopy(self._group_ref_obs_term_concatenate_last_dim["policy"])
+        group_term_names = self._group_ref_obs_term_names["critic"]
+        group_term_concatenate_last_dim = copy.deepcopy(self._group_ref_obs_term_concatenate_last_dim["critic"])
         group_term_concatenate_last_dim += [-1]
-        assert term_name in group_term_names, f"Term {term_name} is not defined in group policy"
+        assert term_name in group_term_names, f"Term {term_name} is not defined in group critic"
         term_idx = group_term_names.index(term_name)
         offset = 0
         # AMP requires only current state, so we need to remove history dimension (if any)
-        if self._group_ref_obs_term_cfgs["policy"][term_idx].history_length > 0 and self._group_ref_obs_term_cfgs["policy"][term_idx].flatten_history_dim:
-            history_length = self._group_ref_obs_term_cfgs["policy"][term_idx].history_length
-            term_dim = self._group_ref_obs_term_dim["policy"][term_idx][-1]
+        if self._group_ref_obs_term_cfgs["critic"][term_idx].history_length > 0 and self._group_ref_obs_term_cfgs["critic"][term_idx].flatten_history_dim:
+            history_length = self._group_ref_obs_term_cfgs["critic"][term_idx].history_length
+            term_dim = self._group_ref_obs_term_dim["critic"][term_idx][-1]
             offset = (term_dim // history_length) * (history_length - 1)
         return group_term_concatenate_last_dim[term_idx] + offset, group_term_concatenate_last_dim[term_idx+1]   
 
@@ -186,7 +187,7 @@ class RefObservationManager(ManagerBase):
                 idx = self._group_ref_obs_term_names[group_name].index(term_name)
                 term_cfg = self._group_ref_obs_term_cfgs[group_name][idx]
                 term_delay = self._group_ref_obs_init_delay[group_name][idx]
-                if term_delay > 0:
+                if term_delay != 0:
                     cp_cur_time = torch.clamp(cur_time - term_delay, min=0.0)
                 else:
                     cp_cur_time = cur_time
@@ -195,7 +196,25 @@ class RefObservationManager(ManagerBase):
                 buf_manager = self._group_ref_obs_term_buffer_manager[group_name]
                 if term_cfg.is_base_pose:
                     return buf_manager.calc_base_pose_cumulative(cp_cur_time, term_cfg.params["lin_vel_name"], term_cfg.params["ang_vel_name"]), buf_manager.calc_mask(cp_cur_time)
-                return buf_manager.calc_obs(term_name, cp_cur_time), buf_manager.calc_mask(cp_cur_time)
+                obs, mask = buf_manager.calc_obs(term_name, cp_cur_time), buf_manager.calc_mask(cp_cur_time)
+                if term_cfg.modifiers is not None:
+                    for mod in term_cfg.modifiers:
+                        obs = mod.func(obs, **mod.params)
+                        
+                 # apply noise
+                if term_cfg.noise is not None:
+                    obs = term_cfg.noise.func(obs, term_cfg.noise)
+                # apply clipping
+                if term_cfg.clip is not None:
+                    obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
+                # apply scaling
+                if term_cfg.scale is not None:
+                    obs = obs.mul_(term_cfg.scale)
+                        
+                if term_cfg.env_func is not None:
+                    func, func_params = term_cfg.env_func, term_cfg.env_func_params
+                    obs = func(self._env, obs, **func_params)
+                return obs, mask
         
         raise ValueError(f"Invalid term name '{term_name}'. Expected one of: {self._group_ref_obs_term_names.values()}.")
     
@@ -303,7 +322,11 @@ class RefObservationManager(ManagerBase):
             # apply scaling
             if term_cfg.scale is not None:
                 obs = obs.mul_(term_cfg.scale)
-            
+                
+            if term_cfg.env_func is not None:
+                func, func_params = term_cfg.env_func, term_cfg.env_func_params
+                obs = func(self._env, obs, **func_params)
+
             if not symmetry:
                 self._group_ref_obs_term_tmp_storage[group_name][term_name] = (obs, obs_mask)
 
@@ -379,10 +402,17 @@ class RefObservationManager(ManagerBase):
             self._group_ref_obs_term_buffer_manager[group_name].set_all_env_ref_id(self.file_indices)
             for idx in range(len(self.tmp_storage)):
                 pkl = self.tmp_storage[idx]
+                seq_len = pkl["trans"].shape[0]
+                cyclic_subseq = pkl.get("cyclic_subseq", None)
+                if cyclic_subseq is not None:
+                    if cyclic_subseq[1] - cyclic_subseq[0] <= 35:
+                        cyclic_subseq = (0, seq_len - 1)
+                else:
+                    cyclic_subseq = (0, seq_len - 1)
                 z = pkl["trans"][0, 2]
                 self._group_ref_obs_term_buffer_manager[group_name].set_env_origin_z(idx, z)
-                self._group_ref_obs_term_buffer_manager[group_name].add_reference('trans', idx, pkl["trans"], False, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
-                self._group_ref_obs_term_buffer_manager[group_name].add_reference('root_orient', idx, pkl["root_orient"], False, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
+                self._group_ref_obs_term_buffer_manager[group_name].add_reference('trans', idx, pkl["trans"].to(self.device), False, pkl["fps"], cyclic_subseq=cyclic_subseq)
+                self._group_ref_obs_term_buffer_manager[group_name].add_reference('root_orient', idx, pkl["root_orient"].to(self.device), False, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
             self._group_ref_obs_term_buffer_manager[group_name].prepare_buffers('trans')
             self._group_ref_obs_term_buffer_manager[group_name].prepare_buffers('root_orient')
 
@@ -409,6 +439,11 @@ class RefObservationManager(ManagerBase):
                 buffer_manager.add_reference(term_name, ref_id, data, term_cfg.is_constant, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
             buffer_manager.prepare_buffers(term_name)
             ref_obs_dims = (0,) if not term_cfg.in_obs_tensor or term_cfg.make_empty else buffer_manager.get_dim(term_name)
+            if term_cfg.env_func is not None:
+                num_envs = self._env.num_envs
+                dummy_obs = torch.zeros((num_envs, *ref_obs_dims), device=self._env.device)
+                dummy_obs = term_cfg.env_func(self._env, dummy_obs, **term_cfg.env_func_params)
+                ref_obs_dims = dummy_obs.shape[1:]
         
         if term_cfg.history_length > 0:
             old_dims = list(ref_obs_dims)
@@ -477,7 +512,7 @@ class RefObservationManager(ManagerBase):
                     term_cfg.history_length = group_cfg.history_length
                     term_cfg.flatten_history_dim = group_cfg.flatten_history_dim
                 
-                if group_cfg.load_seq_delay > 0:
+                if group_cfg.load_seq_delay != 0:
                     term_cfg.load_seq_delay = group_cfg.load_seq_delay
                 
                 ref_obs_dims = self._resolve_reference_term_cfg(f"{group_name}/{term_name}", term_cfg)

@@ -8,6 +8,11 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat, quat_from_matrix, matrix_from_quat, combine_frame_transforms, subtract_frame_transforms
 from GBC.utils.data_preparation.robot_flip_left_right import RobotFlipLeftRight
+from isaaclab.sensors import ContactSensor
+
+import carb
+import isaaclab.sim as sim_utils
+import omni.physics.tensors.impl.api as physx
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
@@ -18,11 +23,6 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     ObsTerm,
 )
 
-import carb
-import isaaclab.sim as sim_utils
-import omni.physics.tensors.impl.api as physx
-
-
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationTermCfg as RefObsTerm
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationCfg as RefObsCfg
 from GBC.gyms.isaaclab_45.managers.ref_obs_term_cfg import ReferenceObservationGroupCfg as RefObsGroup
@@ -31,7 +31,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from GBC.gyms.isaaclab_45.envs import ManagerBasedRefRLEnv
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from GBC.utils.base.base_fk import RobotKinematics
-from GBC.utils.base.math_utils import angle_axis_to_quaternion, rot_mat_to_vec, rot_vec_to_mat, contact_to_phase, is_foot_parallel_from_rot_matrix
+from GBC.utils.base.math_utils import angle_axis_to_quaternion, rot_mat_to_vec, rot_vec_to_mat, contact_to_phase, is_foot_parallel_from_rot_matrix, smooth_quat_savgol, quat_fix
 from isaaclab.utils.math import quat_error_magnitude, quat_from_matrix, quat_inv, quat_mul, quat_apply, euler_xyz_from_quat
 from GBC.gyms.isaaclab_45.managers.physics_modifier_function_wrapper import update
 import torch
@@ -104,6 +104,22 @@ def rot_symmetry(env: ManagerBasedRLEnv, inputs: torch.Tensor, history_length: i
     sym_inputs = sym_inputs.reshape(inputs.shape)
     return sym_inputs
 
+def quat_symmetry(env: ManagerBasedRLEnv, inputs: torch.Tensor, history_length: int = 1, **kwargs) -> torch.Tensor:
+    """Symmetry the quaternion and quaternion related terms.
+
+    This symmetry keeps original w and y values, and multiplies x and z by -1.
+    """
+    # assert inputs.shape[-1] == 4, "Quaternion-wise symmetry only supports data in form (..., 4), but got shape {}".format(inputs.shape)
+    sym_inputs = inputs.clone()
+    sym_inputs = sym_inputs.reshape(-1, history_length, inputs.shape[-1] // history_length)
+    sym_inputs[..., 1] = -sym_inputs[..., 1]
+    sym_inputs[..., 3] = -sym_inputs[..., 3]
+    sym_inputs = sym_inputs.reshape(inputs.shape)
+    return sym_inputs
+
+def no_symmetry(env: ManagerBasedRLEnv, inputs: torch.Tensor, **kwargs) -> torch.Tensor:
+    """No symmetry, return the original inputs."""
+    return inputs
 
 
 def symmetry_by_ref_term_name(env: ManagerBasedRefRLEnv, inputs: torch.Tensor, term_name: str, **kwargs) -> torch.Tensor:
@@ -128,6 +144,56 @@ def symmetry_by_term_name(env: ManagerBasedRLEnv, inputs: torch.Tensor, term_nam
 def get_ref_observation_symmetry(env: ManagerBasedRefRLEnv, ref_observations: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """Get the symmetry of the reference observation."""
     return env.unwrapped.ref_observation_manager.compute_policy_symmetry(ref_observations)
+
+
+###################################################################################################
+
+# env interactive functions
+
+###################################################################################################
+
+def reference_actions_diff(env: ManagerBasedRefRLEnv, actions: torch.Tensor, history_length: int = 1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), **kwargs) -> torch.Tensor:
+    """Compute the actions difference between asset joint pos and actions."""
+    asset = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    actions = actions.reshape(-1, history_length, actions.shape[-1] // history_length)
+    actions_last = actions[:, -1, :]
+    actions = actions_last
+    diff = torch.abs(joint_pos - actions)
+    diff = diff.reshape(actions.shape[0], -1)
+    return diff
+
+def reference_quaternion_diff(env: ManagerBasedRefRLEnv, ref_quaternions: torch.Tensor, history_length: int = 1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), **kwargs) -> torch.Tensor:
+    """Compute the quaternion difference between asset and reference."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_quat = asset.data.root_quat_w
+    ref_quaternions = ref_quaternions.reshape(-1, history_length, ref_quaternions.shape[-1] // history_length)
+    ref_quaternions_last = ref_quaternions[:, -1, :]
+    ref_quaternions = ref_quaternions_last
+    quat_diff = quat_error_magnitude(base_quat, ref_quaternions)
+    return quat_diff.unsqueeze(-1) # shape (num_envs, 1)
+
+def reference_projected_gravity_diff(env: ManagerBasedRefRLEnv, ref_projected_gravity: torch.Tensor, history_length: int = 1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), **kwargs) -> torch.Tensor:
+    """Compute the projected gravity difference between asset and reference."""
+    asset = env.scene[asset_cfg.name]
+    base_proj_gravity = asset.data.projected_gravity_b
+    # measure gravity diff using cosine distance
+    ref_projected_gravity = ref_projected_gravity.reshape(-1, history_length, ref_projected_gravity.shape[-1] // history_length)
+    ref_projected_gravity_last = ref_projected_gravity[:, -1, :]
+    ref_projected_gravity = ref_projected_gravity_last
+    cross = torch.cross(base_proj_gravity, ref_projected_gravity, dim=-1)
+    return cross
+
+def reference_link_pose_diff(env: ManagerBasedRefRLEnv, ref_link_poses: torch.Tensor, history_length: int = 1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), **kwargs) -> torch.Tensor:
+    """Compute the link pose difference between asset link poses and reference link poses."""
+    cur_body_pos = compute_actual_body_pose_robot_frame(env, asset_cfg)
+    ref_link_poses = ref_link_poses.reshape(-1, history_length, ref_link_poses.shape[-1] // history_length)
+    ref_link_poses = ref_link_poses[:, -1, :]
+    pos_diff = cur_body_pos[..., :3] - ref_link_poses[..., :3]
+    quat_diff = quat_error_magnitude(cur_body_pos[..., 3:7], ref_link_poses[..., 3:7])
+    diff = torch.cat([pos_diff, quat_diff.unsqueeze(-1)], dim=-1)
+    return diff
+
 ###################################################################################################
 
 # tool functions
@@ -159,6 +225,7 @@ def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.
     return phase
 
 
+
 ###################################################################################################
 
 # Done Terms
@@ -185,6 +252,19 @@ def root_height_below_minimum_with_reference(
     target_min_height[~mask] = minimum_height
 
     return asset.data.root_pos_w[:, 2] < target_min_height
+
+def body_link_gravity_projection_exceed_threshold(env: ManagerBasedRLEnv, threshold: float = 0.25, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_ids=[0])) -> torch.Tensor:
+    """Terminate when the projection of gravity on the specified body link exceeds the threshold.
+
+    Note:
+        This is currently only supported for flat terrains, i.e. the threshold is in the world frame.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_orn = asset.data.body_link_quat_w[:, asset_cfg.body_ids] # should be (num_envs, num_bodies, 4)
+    z_vec = torch.tensor([0, 0, 1], device=env.device, dtype=torch.float32).unsqueeze(0).repeat(body_orn.shape[0], 1) # (num_envs, 3)
+    body_z = quat_rotate_inverse(body_orn, z_vec.unsqueeze(1)).mean(dim=1) # (num_envs, 3)
+    cos_diff = 1 - body_z[:, 2] # (num_envs,)
+    return cos_diff > threshold
     
 
 ###################################################################################################
@@ -197,8 +277,8 @@ def joint_pos_l2(env: ManagerBasedRefRLEnv, asset_cfg: SceneEntityCfg = SceneEnt
     asset = env.scene[asset_cfg.name]
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     return torch.sum(torch.square(joint_pos), dim=1)
-    
-def phase_feet_contact(env, period: float, sensor_cfg: SceneEntityCfg, contact_phase_thresh: float = 0.55, contact_time_thresh = 0.01) -> torch.Tensor:
+
+def phase_feet_contact(env, period: float, sensor_cfg: SceneEntityCfg, contact_phase_thresh: float = 0.55, contact_time_thresh = 0.01, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Reward the agent for tracking the target feet contact."""
     if hasattr(env.unwrapped, "episode_length_buf"):
         cur_time = env.episode_length_buf.to(torch.float32) * env.step_dt
@@ -222,10 +302,13 @@ def phase_feet_contact(env, period: float, sensor_cfg: SceneEntityCfg, contact_p
     rht_feet_rot_mat = matrix_from_quat(rht_feet_quat).unsqueeze(1)
     feet_rot_mat = torch.cat([lft_feet_rot_mat, rht_feet_rot_mat], dim=1)
     is_parallel = is_foot_parallel_from_rot_matrix(feet_rot_mat, tolerance_deg=10)
-    has_contact &= is_parallel
+    # has_contact &= is_parallel
     # has_contact &= (contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > 5.0 * contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :2].norm(dim=-1))
     reward = (target_feet_contact == has_contact)
-    return torch.sum(reward.float(), dim=1)
+    penalty = (target_feet_contact != has_contact)
+    has_parallel_contact = is_parallel & has_contact
+    has_parallel_contact_reward = has_parallel_contact * reward
+    return torch.sum(reward.float(), dim=1) + torch.sum(has_parallel_contact_reward.float(), dim=1) * 0.75 - 0.5 * torch.sum(penalty.float(), dim=1)
 
 def contact_no_vel(env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg, contact_time_thresh: float = 0.01) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
@@ -279,9 +362,20 @@ def reference_action_std(inputs, env: ManagerBasedRLEnv, urdf_path: str, asset_c
 def reference_rotation_refine(input, env: ManagerBasedRLEnv, pikle_cfg = {}):
     """Refine the reference rotations."""
     input = rot_vec_to_mat(input)
-    rot_0 = input[:, 0]
+    rot_0 = input[0] # fix this serious bug. Luckily it wasn't used before
     input = torch.einsum("ij, bjk -> bik", rot_0.transpose(0, 1), input) # set the first rotation to original direction
     return input
+
+def reference_root_quat_from_rot(input, env: ManagerBasedRLEnv, pickle_cfg = {}):
+    """Convert the reference root orientation from rotation vector to quaternion."""
+    input = quat_from_matrix(rot_vec_to_mat(input))
+    # input = quat_fix(input)
+    # try:
+    #     input = smooth_quat_savgol(input, window_size=11, poly_order=3)
+    # except: # len of input < window_size
+    #     carb.log_warn("Failed to smooth the reference root orientation.")
+    return input
+    
 
 def reference_action_velocity(input, env: ManagerBasedRLEnv, urdf_path: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), pickle_cfg = {}):
     reshaped_actions = reference_action_reshape(input, env, urdf_path, asset_cfg, pickle_cfg)
@@ -300,6 +394,17 @@ def reference_link_poses(actions, env: ManagerBasedRLEnv, urdf_path: str, asset_
     assert tfs.shape == (actions.shape[0], len(link_names), 4, 4)
 
     return torch.cat([tfs[..., :3, 3], quat_from_matrix(tfs[..., :3, :3])], dim=-1)
+
+
+def relative_feet_height(env, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), height_max: float = 0.3) -> torch.Tensor:
+    """Reward the agent for keeping the feet at a relative height."""
+    asset = env.scene[asset_cfg.name]
+    feet_states = asset.data.body_state_w[:, asset_cfg.body_ids, 2]  # z (world frame)
+    feet_height = torch.abs(feet_states[:, 0] - feet_states[:, 1])
+    feet_height = torch.clamp(feet_height, max=height_max)
+    command = env.command_manager.get_command(command_name)
+    return feet_height * (torch.norm(command[:, :2], dim=1) >= 0.1).float()
+
 
 def reference_feet_contact_phase(input, env: ManagerBasedRLEnv, index: int, offset: float = 0.0, threshold: float = 0.55, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), pickle_cfg = {}):
     """Get the feet contact phase from the reference data."""
@@ -486,7 +591,7 @@ def randomize_initial_start_time(
     epi_len = env.max_episode_length_s # in seconds
     # randomized_sample_time = torch.random.uniform(0, 1, size=(env.num_envs,), device=env.device) * epi_len * (1 - sample_episode_ratio) + epi_len * sample_episode_ratio
     randomized_sample_time = torch.rand(env.num_envs, device=env.device) * epi_len * sample_episode_ratio
-    env.ref_observation_manager.start_time[env_ids] = randomized_sample_time[env_ids]
+    env.unwrapped.ref_observation_manager.start_time[env_ids] = randomized_sample_time[env_ids]
 
 def reset_root_state_by_start_time(
         env: ManagerBasedRefRLEnv,
@@ -504,7 +609,7 @@ def reset_root_state_by_start_time(
     """
     asset = env.scene[asset_cfg.name]
     # get original root state
-    original_root_states = asset.data.default_root_state[env_ids].clone()
+    original_root_states = asset.data.default_root_state.clone()
     # get reference root pos at start time
     base_pose_w, _ = env.ref_observation_manager.compute_term("target_base_pose", torch.zeros(env.num_envs, dtype=torch.float32).to(env.device))
     root_lin_velocities, _ = env.ref_observation_manager.compute_term("base_lin_vel", torch.zeros(env.num_envs, dtype=torch.float32).to(env.device))
@@ -512,23 +617,35 @@ def reset_root_state_by_start_time(
     # root_orientations = angle_axis_to_quaternion(root_orientations)
     # root_positions += env.scene.env_origins
 
-    root_positions = base_pose_w[:, :3] + env.scene.env_origins
+    root_positions = base_pose_w[:, :3]
+    # root_xy_delta = root_positions[:, :3] - original_root_states[:, :3]
+    # root_xy_delta[:, 2] = 0.0
+    # root_positions = original_root_states[:, :3] + root_xy_delta + env.scene.env_origins
     root_orientations = base_pose_w[:, 3:7]
+    if drop_z:
+        root_positions[:, 2] = original_root_states[:, 2] + 0.05 # slightly above the ground to avoid collision
     
     root_mask = mask[env_ids]
     root_positions = root_positions[env_ids]
-    root_positions = torch.where(root_mask.unsqueeze(1), root_positions, original_root_states[:, :3])
-    if drop_z:
-        root_positions[:, 2] = original_root_states[:, 2]
+    root_positions = torch.where(root_mask.unsqueeze(1), root_positions, original_root_states[env_ids, :3])
+    asset: Articulation = env.scene[asset_cfg.name]
     root_orientations = root_orientations[env_ids]
-    root_orientations = torch.where(root_mask.unsqueeze(1), root_orientations, original_root_states[:, 3:7])
-    root_lin_velocities = root_lin_velocities[env_ids]
-    root_lin_velocities = torch.where(root_mask.unsqueeze(1), root_lin_velocities, original_root_states[:, 7:10])
-    root_ang_velocities = root_ang_velocities[env_ids]
-    root_ang_velocities = torch.where(root_mask.unsqueeze(1), root_ang_velocities, original_root_states[:, 10:13])
+    root_orientations = torch.where(root_mask.unsqueeze(1), root_orientations, original_root_states[env_ids, 3:7])
+    # root_positions = original_root_states[env_ids, :3]
+    # root_orientations = original_root_states[env_ids, 3:7]
+    # root_lin_velocities = torch.zeros_like(root_lin_velocities[env_ids])
+    root_lin_velocities = original_root_states[env_ids, 7:10]
+    # root_ang_velocities = torch.zeros_like(root_ang_velocities[env_ids])
+    root_ang_velocities = original_root_states[env_ids, 10:13]
+    # reset contact sensor history
+    contact_sensors = env.scene.sensors["contact_forces"]
+    contact_sensors.reset(env_ids)
     # set the root state
     asset.write_root_pose_to_sim(torch.cat([root_positions, root_orientations], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(torch.cat([root_lin_velocities, root_ang_velocities], dim=-1), env_ids=env_ids)
+    
+    
+    
 
     
 def reset_joints_by_start_time(
@@ -569,12 +686,32 @@ def reset_joints_by_start_time(
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
 
+def do_the_fucking_all_three_resets_since_isaaclab_always_reset_joints_first_rather_than_given_order_and_i_dont_know_why(
+        env: ManagerBasedRefRLEnv,
+        env_ids: torch.Tensor,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        sample_episode_ratio: float = 1.0, # between 0 and 1
+        drop_z: bool = True, # drop z axis, since converted translation z from AMASS/HUMANML/MotionX is not accurate
+        add_joint_vel: bool = True,
+):
+    """Reset the root state and joints of the robot by start time.
+    
+    This replaces the `reset_start_time`, `reset_base` and `reset_joint` functions in velocity_env_cfg. Resetting robot initial position according to the start time and reference data.
+
+    This term must be called **AFTER** `randomize_initial_start_time` function.
+
+    While registering terms, make sure to register initial_start_first.
+    """
+    randomize_initial_start_time(env, env_ids, sample_episode_ratio)
+    reset_root_state_by_start_time(env, env_ids, asset_cfg, drop_z)
+    reset_joints_by_start_time(env, env_ids, asset_cfg, add_joint_vel)
+
+
 ###################################################################################################
 
 # physics modifier functions
 
 ###################################################################################################
-
 
 class ExternalGravityUpdater:
     def __init__(self):
@@ -729,7 +866,7 @@ def external_z_force_base(
     assert apply_force_duration_ratio <=1 and apply_force_duration_ratio >= 0, f"apply_force_duration_ratio should be in [0, 1]."
     assert max_force >= 0, f"max_force should be non-negative."
     assert apply_offset_range >= 0, f"apply_offset_range should be non-negative."
-    asset = env.scene[asset_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
         
@@ -754,9 +891,9 @@ def external_z_force_base(
     z_force = torch.where(cur_time < env.max_episode_length_s * apply_force_duration_ratio, z_force, torch.zeros_like(z_force))
     
     forces = torch.zeros((len(env_ids), len(asset_cfg.body_ids), 3), device=env.device)
-    forces[:, :, 2] = z_force.unsqueeze(1).repeat(1, len(asset_cfg.body_ids))
+    forces[:, :, 2] = z_force.unsqueeze(1).repeat(1, len(asset_cfg.body_ids)) # (env_ids, num_assets, 3)
 
-    tf_mat = matrix_from_quat(root_states[:, 3:7])
+    tf_mat = matrix_from_quat(root_states[:, 3:7]).transpose(1, 2) # (env_ids, 3, 3)
     forces = torch.einsum("ijk, ilk -> ilj", tf_mat, forces)
 
     torque = torch.zeros_like(forces)
@@ -784,6 +921,7 @@ def track_lin_vel_xy_yaw_frame_exp_custom(
     # extract the used quantities (to enable type-hinting)
     if not hasattr(track_lin_vel_xy_yaw_frame_exp_custom, "std_updater_dict"):
         track_lin_vel_xy_yaw_frame_exp_custom.std_updater_dict = {}
+        track_lin_vel_xy_yaw_frame_exp_custom.std = std
 
     if std_updater_cfg is not None:
         std_updater_dict = track_lin_vel_xy_yaw_frame_exp_custom.std_updater_dict
@@ -791,6 +929,7 @@ def track_lin_vel_xy_yaw_frame_exp_custom(
         if key not in std_updater_dict:
             std_updater_dict[key] = StdUpdater(**std_updater_cfg)
         std = std_updater_dict[key].update(env)
+        track_lin_vel_xy_yaw_frame_exp_custom.std = std
 
     # std=lin_vel_std_updater.update(env)
     asset = env.scene[asset_cfg.name]
@@ -818,13 +957,15 @@ def track_ang_vel_z_world_exp_custom(
 
     if not hasattr(track_ang_vel_z_world_exp_custom, "std_updater_dict"):
         track_ang_vel_z_world_exp_custom.std_updater_dict = {}
-    
+        track_ang_vel_z_world_exp_custom.std = std
+
     if std_updater_cfg is not None:
         std_updater_dict = track_ang_vel_z_world_exp_custom.std_updater_dict
         key = std_updater_cfg["reward_key"]
         if key not in std_updater_dict:
             std_updater_dict[key] = StdUpdater(**std_updater_cfg)
         std = std_updater_dict[key].update(env)
+        track_ang_vel_z_world_exp_custom.std = std
 
     return torch.exp(-ang_vel_error / std**2)
 
@@ -838,7 +979,7 @@ def tracking_target_actions_exp(env, std: float = 0.5, type = None, method = "no
         raise RuntimeError("Reference observation manager is not available, function `tracking_target_actions_exp` cannot be called.")
     if not hasattr(tracking_target_actions_exp, "std_updater_dict"):
         tracking_target_actions_exp.std_updater_dict = {}
-
+        tracking_target_actions_exp.std = std
     # cur_time = (env.episode_length_buf.to(torch.float32) - 1) * env.step_dt
     actions, mask = env.ref_observation_manager.get_term("target_actions")
     if mask is None:
@@ -857,6 +998,7 @@ def tracking_target_actions_exp(env, std: float = 0.5, type = None, method = "no
         if key not in std_updater_dict:
             std_updater_dict[key] = StdUpdater(**std_updater_cfg)
         std = std_updater_dict[key].update(env)
+        tracking_target_actions_exp.std = std
     return torch.exp(-actions_error / std**2)
 
 def tracking_target_actions_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
@@ -866,6 +1008,30 @@ def tracking_target_actions_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
     actions_diff = torch.where(mask.unsqueeze(1), actions - joint_pos, torch.zeros_like(actions))
     return torch.norm(actions_diff, dim=1)
+
+def tracking_target_actions_diff_exp(env, std: float = 0.4, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), std_updater_cfg = None):
+    
+    if not hasattr(env, "ref_observation_manager"):
+        raise RuntimeError("Reference observation manager is not available, function `tracking_target_actions_diff_exp` cannot be called.")
+    if not hasattr(tracking_target_actions_diff_exp, "std_updater_dict"):
+        tracking_target_actions_diff_exp.std_updater_dict = {}
+        tracking_target_actions_diff_exp.std = std
+        
+    actions_diff, mask = env.ref_observation_manager.get_term("target_actions_diff")
+    actions_diff = actions_diff[:, asset_cfg.joint_ids]
+    if std_updater_cfg is not None:
+        std_updater_dict = tracking_target_actions_diff_exp.std_updater_dict
+        key = std_updater_cfg["reward_key"]
+        if key not in std_updater_dict:
+            std_updater_dict[key] = StdUpdater(**std_updater_cfg)
+        std = std_updater_dict[key].update(env)
+        tracking_target_actions_diff_exp.std = std
+    actions_diff = torch.where(mask.unsqueeze(1), actions_diff, torch.zeros_like(actions_diff))
+    actions_diff = torch.norm(actions_diff, dim=1)
+    return torch.exp(-actions_diff**2 / std**2)
+
+# def tracking_target_gravity_diff_exp(env, std: float = 0.4, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+#     ref_gravity_diff, mask = env.ref_observation_manager.get_term("target_projected_gravity_diff")
 
 def unbalanced_tracking_left_right(env, left_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), right_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), sigma: float = 0.4, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
     actions, mask = env.ref_observation_manager.get_term("target_actions")
@@ -897,6 +1063,7 @@ def tracking_target_actions_normalized_exp(
         raise RuntimeError("Reference observation manager is not available, function `tracking_target_actions_normalized_exp` cannot be called.")
     if not hasattr(tracking_target_actions_normalized_exp, "std_updater_dict"):
         tracking_target_actions_normalized_exp.std_updater_dict = {}
+        tracking_target_actions_normalized_exp.std = std
 
 
     actions, mask = env.ref_observation_manager.get_term("target_actions")
@@ -921,6 +1088,7 @@ def tracking_target_actions_normalized_exp(
         if key not in std_updater_dict:
             std_updater_dict[key] = StdUpdater(**std_updater_cfg)
         std = std_updater_dict[key].update(env)
+        tracking_target_actions_normalized_exp.std = std
     return torch.exp(-actions_error / std**2)
 
 
@@ -1173,6 +1341,21 @@ def tracking_body_pos_robot_frame(env, std: float, xyz_dim: tuple = (0, 1, 2), a
     error = torch.where(mask, error, torch.zeros_like(error))
     return torch.exp(-error / std**2)
 
+def tracking_body_pos_robot_frame_l2(env, xyz_dim: tuple = (0, 1, 2), asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    target, mask = env.ref_observation_manager.get_term("target_link_poses")
+    target = target[:, asset_cfg.body_ids]
+    actual = compute_actual_body_pose_robot_frame(env, asset_cfg)
+    if isinstance(xyz_dim, tuple): # none singluar dimension
+        actual = actual[..., xyz_dim]
+        target = target[..., xyz_dim]
+    else:
+        actual = actual[..., xyz_dim].unsqueeze(-1)
+        target = target[..., xyz_dim].unsqueeze(-1)
+    error = torch.mean(torch.square(target - actual), dim=(1, 2))
+    error = torch.where(mask, error, torch.zeros_like(error))
+    return torch.sqrt(error)
+
+
 def tracking_body_quat_robot_frame(env, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
     target, mask = env.ref_observation_manager.get_term("target_link_poses")
     target = target[:, asset_cfg.body_ids]
@@ -1240,14 +1423,98 @@ def feet_distance_relative_to_target(env, asset_cfg: SceneEntityCfg = SceneEntit
     distance_diff = target_feet_distance * coef - actual_feet_distance
     return torch.where(mask, distance_diff.clamp(min=0), torch.zeros_like(distance_diff))
 
-def tracking_base_height(env, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+def tracking_base_height(env, std: float, offset : float = 0.12, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
     # std = feet_xy_std_updater.update(env)
     actual = env.scene[asset_cfg.name].data.root_state_w[:, 2]
     target, mask = env.ref_observation_manager.get_term("target_base_pose")
-    target = target[:, 2]
+    target = target[:, 2] + offset
     error = torch.square(target - actual)
     error = torch.where(mask, error, torch.zeros_like(error))
     return torch.exp(-error / std**2)
+
+def tracking_base_xyz_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    actual = env.scene[asset_cfg.name].data.root_state_w[:, :3]
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    target = target[:, :3]
+    error = torch.norm(target - actual, dim=1)
+    error = torch.where(mask, error, torch.zeros_like(error))
+    return error**2
+
+def tracking_base_xyz_exp(env, std=1.0, z_axis_offset: float = 0.12, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), std_updater_cfg = None) -> torch.Tensor:
+    if not hasattr(tracking_base_xyz_exp, "std_updater_dict"):
+        tracking_base_xyz_exp.std_updater_dict = {}
+        tracking_base_xyz_exp.std = std 
+    if std_updater_cfg is not None:
+        std_updater_dict = tracking_base_xyz_exp.std_updater_dict
+        key = std_updater_cfg["reward_key"]
+        if key not in std_updater_dict:
+            std_updater_dict[key] = StdUpdater(**std_updater_cfg)
+        std = std_updater_dict[key].update(env)
+        tracking_base_xyz_exp.std = std
+    actual = env.scene[asset_cfg.name].data.root_state_w[:, :3]
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    target = target[:, :3]
+    target[:, 2] += z_axis_offset
+    error = torch.norm(target - actual, dim=1)
+    error = torch.where(mask, error, torch.zeros_like(error))
+    return torch.exp(-error / std**2)
+
+def tracking_base_orient_l2(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    actual = env.scene[asset_cfg.name].data.root_state_w[:, 3:7]
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    target = target[:, 3:7]
+    error = quat_error_magnitude(target, actual)
+    error = torch.where(mask, error, torch.zeros_like(error))
+    return error**2
+
+# actually, this function does the same thing as tracking_target_root_orient_exp, but keep it for name consistency
+def tracking_base_quaternion_exp(env, std: float = 0.25, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), std_updater_cfg = None):
+    if not hasattr(tracking_base_quaternion_exp, "std_updater_dict"):
+        tracking_base_quaternion_exp.std_updater_dict = {}
+        tracking_base_quaternion_exp.std = std
+    
+    asset: Articulation = env.scene[asset_cfg.name]
+    actual = asset.data.root_quat_w # change the interface, so it is not so confusing
+    target, mask = env.ref_observation_manager.get_term("target_quaternion")
+    error = quat_error_magnitude(target, actual)
+    error = torch.where(mask, error, torch.zeros_like(error))
+    if std_updater_cfg is not None:
+        std_updater_dict = tracking_base_quaternion_exp.std_updater_dict
+        key = std_updater_cfg["reward_key"]
+        if key not in std_updater_dict:
+            std_updater_dict[key] = StdUpdater(**std_updater_cfg)
+        std = std_updater_dict[key].update(env)
+        tracking_base_quaternion_exp.std = std
+    return torch.exp(-error / std**2)
+
+def tracking_base_quaternion_diff_exp(env, std: float = 0.25, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), std_updater_cfg = None) -> torch.Tensor:
+    if not hasattr(tracking_base_quaternion_diff_exp, "std_updater_dict"):
+        tracking_base_quaternion_diff_exp.std_updater_dict = {}
+        tracking_base_quaternion_diff_exp.std = std
+    
+    magnitude, mask = env.ref_observation_manager.get_term("target_quaternion_diff")
+    magnitude = magnitude.clone().squeeze(-1)
+    magnitude = torch.where(mask, magnitude, torch.zeros_like(magnitude))
+    if std_updater_cfg is not None:
+        std_updater_dict = tracking_base_quaternion_diff_exp.std_updater_dict
+        key = std_updater_cfg["reward_key"]
+        if key not in std_updater_dict:
+            std_updater_dict[key] = StdUpdater(**std_updater_cfg)
+        std = std_updater_dict[key].update(env)
+        tracking_base_quaternion_diff_exp.std = std
+    return torch.exp(-magnitude / std**2)
+
+
+def tracking_base_heading_exp(env, std: float = 0.25, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    actual = env.scene[asset_cfg.name].data.root_quat_w
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    target = target[:, 3:7]
+    actual_yaw = yaw_quat(actual)
+    target_yaw = yaw_quat(target)
+    error = quat_error_magnitude(target_yaw, actual_yaw)
+    error = torch.where(mask, error, torch.zeros_like(error))
+    return torch.exp(-error / std**2)    
+    
 
 def base_height_square(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     actual = env.scene[asset_cfg.name].data.root_state_w[:, 2]
@@ -1426,6 +1693,21 @@ def feet_contact_forces(env, sensor_cfg: SceneEntityCfg, max_contact_force: floa
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     contacts = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
     return torch.sum((torch.norm(contacts, dim=-1) - max_contact_force).clamp(min=0.0), dim=1)
+
+
+def feet_contact_forces_delta_rate(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact_forces_history = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :] # shape: (num_envs, T, num_feet, 3)
+    T = contact_forces_history.shape[1]
+    contact_forces_z = contact_forces_history[:, :, :, 2]
+    z_spectrum = torch.fft.rfft(contact_forces_z, dim=1)
+    power = torch.abs(z_spectrum)**2
+    high_freq_power = power[:, T//4:].sum(dim=1) # shape: (num_envs, num_feet)
+    total_power = power[:, 1:].sum(dim=1) + 1e-6 # shape: (num_envs, num_feet)
+    high_freq_power = high_freq_power / total_power # shape: (num_envs, num_feet)
+    high_freq_power = torch.sum(high_freq_power, dim=1) # shape: (num_envs,)    
+    return high_freq_power
+    
 
 
 def feet_air_time_balancing(env, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float = 0.4) -> torch.Tensor:

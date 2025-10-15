@@ -5,6 +5,19 @@ from isaaclab.utils.math import yaw_quat, quat_apply, quat_inv, quat_mul, combin
 from GBC.utils.base.math_utils import angle_axis_to_quaternion, quat_rotate_inverse
 import numpy as np
 
+@wp.func
+def quat_mul_wp(q1: wp.quat, q2: wp.quat) -> wp.quat:
+    # Warp quaternion format: (x, y, z, w)
+    x1, y1, z1, w1 = q1[0], q1[1], q1[2], q1[3]
+    x2, y2, z2, w2 = q2[0], q2[1], q2[2], q2[3]
+    
+    w_out = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x_out = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y_out = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z_out = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    
+    return wp.quat(x_out, y_out, z_out, w_out)
+
 class BufferType:
     singular = 0
     recurrent = 1
@@ -149,7 +162,7 @@ class BufferManager:
         elif recurrent_subseq[rid][0] == -1 or max_len[rid] == -1:
             # Singular buffer
             if idx >= max_len[rid]:
-                idx = -1
+                idx = 0
             else:
                 idx += start_index[rid]
             num_cyclic_subseq[tid] = 0
@@ -169,9 +182,12 @@ class BufferManager:
                 begin_idx[tid] = 0
                 end_idx[tid] = 0
 
-            # idx += start_index[rid]
-            # begin_idx[tid] += start_index[rid]
-            # end_idx[tid] += start_index[rid]
+            idx += start_index[rid]
+            begin_idx[tid] += start_index[rid]
+            end_idx[tid] += start_index[rid]
+            buffer_size = start_index[rid] + max_len[rid]
+            if end_idx[tid] >= buffer_size:
+                end_idx[tid] = buffer_size - 1
         current_idx[tid] = idx
         num_cyclic_subseq[tid] = num_subseq
 
@@ -229,6 +245,8 @@ class BufferManager:
     def calc_obs(self, key, current_time: torch.Tensor):
         if self.is_constant[key]:
             return self.ref_buffer[key][self.env_ref_id, ...]
+        if 'target_quaternion' in key:
+            return self.calculate_quat_obs(key, current_time)
         current_idx = self.calc_idx(current_time)
         return self.ref_buffer[key][current_idx, ...]
     
@@ -377,68 +395,6 @@ class BufferManager:
         
         return cumulative_obs
 
-    # def benchmark_cumulative_obs(self, key, current_time: torch.Tensor, num_iterations: int = 100):
-    #     """
-    #     Benchmark performance comparison between baseline, CPU optimized, and CUDA versions.
-        
-    #     Args:
-    #         key: Buffer key to test
-    #         current_time: Current time tensor
-    #         num_iterations: Number of iterations for timing
-            
-    #     Returns:
-    #         dict: Performance comparison results
-    #     """
-    #     import time
-        
-    #     # Warmup
-    #     for _ in range(10):
-    #         _ = self.calc_cumulative_obs(key, current_time)      # Baseline
-    #         _ = self.calc_cumulative_obs_v2(key, current_time)   # CPU optimized
-    #         _ = self.calc_cumulative_obs_cuda(key, current_time) # CUDA
-        
-    #     torch.cuda.synchronize()
-        
-    #     # Benchmark baseline (original slow but accurate version)
-    #     start_time = time.time()
-    #     for _ in range(num_iterations):
-    #         result_baseline = self.calc_cumulative_obs(key, current_time)
-    #     torch.cuda.synchronize()
-    #     baseline_time = time.time() - start_time
-        
-    #     # Benchmark CPU optimized version
-    #     start_time = time.time()
-    #     for _ in range(num_iterations):
-    #         result_cpu = self.calc_cumulative_obs_v2(key, current_time)
-    #     torch.cuda.synchronize()
-    #     cpu_time = time.time() - start_time
-        
-    #     # Benchmark CUDA version  
-    #     start_time = time.time()
-    #     for _ in range(num_iterations):
-    #         result_cuda = self.calc_cumulative_obs_cuda(key, current_time)
-    #     torch.cuda.synchronize()
-    #     cuda_time = time.time() - start_time
-        
-    #     # Verify results are consistent
-    #     max_diff_cpu = torch.max(torch.abs(result_baseline - result_cpu)).item()
-    #     max_diff_cuda = torch.max(torch.abs(result_baseline - result_cuda)).item()
-    #     max_diff_cpu_cuda = torch.max(torch.abs(result_cpu - result_cuda)).item()
-        
-    #     return {
-    #         'baseline_time': baseline_time / num_iterations,
-    #         'cpu_time': cpu_time / num_iterations,
-    #         'cuda_time': cuda_time / num_iterations,
-    #         'cpu_speedup_vs_baseline': baseline_time / cpu_time,
-    #         'cuda_speedup_vs_baseline': baseline_time / cuda_time,
-    #         'cuda_speedup_vs_cpu': cpu_time / cuda_time,
-    #         'max_diff_cpu_vs_baseline': max_diff_cpu,
-    #         'max_diff_cuda_vs_baseline': max_diff_cuda,
-    #         'max_diff_cpu_vs_cuda': max_diff_cpu_cuda,
-    #         'num_envs': self.num_envs,
-    #         'obs_shape': result_baseline.shape
-    #     }
-
     def calc_cumulative_obs_v2(self, key, current_time: torch.Tensor):
         if self.is_constant[key]:
             return self.ref_buffer[key][self.env_ref_id, ...]
@@ -454,10 +410,10 @@ class BufferManager:
         )
         
         # Calculate indices for each environment
-        begin_indices = current_begin_idx + start_idx  # shape: (num_envs,)
-        end_indices = current_end_idx + start_idx      # shape: (num_envs,)
-        current_indices = current_idx + start_idx      # shape: (num_envs,)
-        
+        begin_indices = current_begin_idx  # shape: (num_envs,)
+        end_indices = current_end_idx  # shape: (num_envs,)
+        current_indices = current_idx  # shape: (num_envs,)
+
         # Get the maximum lengths needed for each part
         max_first_len = (begin_indices - start_idx).max()
         max_cyclic_len = (end_indices - begin_indices).max()
@@ -514,10 +470,10 @@ class BufferManager:
         )
 
         # Calculate indices for each environment
-        begin_indices = current_begin_idx + start_idx  # shape: (num_envs,)
-        end_indices = current_end_idx + start_idx      # shape: (num_envs,)
-        current_indices = current_idx + start_idx      # shape: (num_envs,)
-        
+        begin_indices = current_begin_idx  # shape: (num_envs,)
+        end_indices = current_end_idx    # shape: (num_envs,)
+        current_indices = current_idx   # shape: (num_envs,)
+
         # Get the maximum lengths needed for each part
         max_first_len = (begin_indices - start_idx).max()
         max_cyclic_len = (end_indices - begin_indices).max()
@@ -609,15 +565,19 @@ class BufferManager:
         lin_vel_yaw_frame = self.calc_obs(lin_vel_name, current_time)
         ang_vel = self.calc_obs(ang_vel_name, current_time)
         try:
-            self.step_robot_base_pose(current_time, lin_vel_yaw_frame, ang_vel)
+            self.base_pos, self.base_quat = self.calc_base_pose_from_trans_quat(current_time)
             return torch.cat([self.base_pos, self.base_quat], dim=1)
         except:
-            self.last_pose_tme = torch.where(
-                torch.logical_and(self.last_pose_tme < 0, current_time < 1e-5),
-                self.last_pose_tme,
-                current_time.clone()
-            )
-            return self.calc_base_pose_cumulative(current_time, lin_vel_name, ang_vel_name)
+            try:
+                self.step_robot_base_pose(current_time, lin_vel_yaw_frame, ang_vel)
+                return torch.cat([self.base_pos, self.base_quat], dim=1)
+            except:
+                self.last_pose_tme = torch.where(
+                    torch.logical_and(self.last_pose_tme < 0, current_time < 1e-5),
+                    self.last_pose_tme,
+                    current_time.clone()
+                )
+                return self.calc_base_pose_cumulative(current_time, lin_vel_name, ang_vel_name)
     
     
     def calc_base_pose_from_trans_orient(self, current_time: torch.Tensor):
@@ -626,21 +586,244 @@ class BufferManager:
         lin_pos = self.ref_buffer['trans'][idx]
         ang_pos = self.ref_buffer['root_orient'][idx]
         return lin_pos, ang_pos
+    
+    
+    
+    @wp.kernel
+    def compute_cumulative_pose(
+        final_pos_out: wp.array(dtype=wp.vec3),
+        final_quat_out: wp.array(dtype=wp.quat),
 
+        trans_buffer: wp.array(dtype=wp.vec3),
+        quat_buffer: wp.array(dtype=wp.quat), 
+        
+        current_indices: wp.array(dtype=wp.int32),
+        begin_indices: wp.array(dtype=wp.int32),
+        current_num_cyclic_subseq: wp.array(dtype=wp.int32),
+        
+        cyclic_quat_diff: wp.array(dtype=wp.quat),
+        cyclic_lin_xyz_diff_local: wp.array(dtype=wp.vec3)
+    ):
+        tid = wp.tid()
+
+        c_idx = current_indices[tid]
+        b_idx = begin_indices[tid]
+        num_cycles = current_num_cyclic_subseq[tid]
+        if c_idx < b_idx:
+            final_pos_out[tid] = trans_buffer[c_idx]
+            final_quat_out[tid] = quat_buffer[c_idx]
+        else:
+            
+            accumulated_pos = trans_buffer[b_idx]
+            accumulated_quat = quat_buffer[b_idx]
+
+            i = wp.int32(0)
+            while i < num_cycles:
+                accumulated_pos += wp.quat_rotate(accumulated_quat, cyclic_lin_xyz_diff_local[tid])
+                accumulated_quat = quat_mul_wp(accumulated_quat, cyclic_quat_diff[tid])
+                i += 1
+
+            q_current_in_cycle = quat_buffer[c_idx]
+            p_current_in_cycle = trans_buffer[c_idx]
+            q_begin_in_cycle = quat_buffer[b_idx]
+            p_begin_in_cycle = trans_buffer[b_idx]
+            q_diff_in_cycle = quat_mul_wp(q_current_in_cycle, wp.quat_inverse(q_begin_in_cycle))
+            p_diff_in_cycle = p_current_in_cycle - p_begin_in_cycle
+            p_diff_in_cycle_local = wp.quat_rotate(wp.quat_inverse(q_begin_in_cycle), p_diff_in_cycle)
+            accumulated_pos += wp.quat_rotate(accumulated_quat, p_diff_in_cycle_local)
+            accumulated_quat = quat_mul_wp(accumulated_quat, q_diff_in_cycle)
+            final_pos_out[tid] = accumulated_pos
+            final_quat_out[tid] = accumulated_quat
+    
+    def calc_base_pose_from_trans_quat(self, current_time: torch.Tensor):
+        # this function is only available when "target_quaternion" is stored in the buffer (MUST BE THIS EXACT NAME)
+        # however, this is pure table lookup. Time complexity is O(1). Only a little bit slower, since it has some adds and multiplies
+        assert 'trans' in self.ref_buffer.keys() and 'target_quaternion' in self.ref_buffer.keys()
+        def to_xyzw(q_wxyz):
+            return q_wxyz.roll(shifts=-1, dims=-1).contiguous()
+        def to_wxyz(q_xyzw):
+            return q_xyzw.roll(shifts=1, dims=-1).contiguous()
+        current_num_cyclic_subseq, current_idx, current_begin_idx, current_end_idx = self.calc_num_cyclic_subseq(current_time)
+        begin_indices = current_begin_idx  # shape: (num_envs,)
+        end_indices = current_end_idx      # shape: (num_envs,)
+        end_indices = torch.clamp(end_indices, max=self.ref_buffer["trans"].shape[0]-1)
+        current_indices = current_idx      # shape: (num_envs,)
+        
+        q_begin = self.ref_buffer['target_quaternion'][begin_indices]
+        q_end = self.ref_buffer['target_quaternion'][end_indices]
+        cyclic_quat_diff = quat_mul(q_end, quat_inv(q_begin))
+        
+        #    p_delta = p_end - p_begin
+        p_begin = self.ref_buffer['trans'][begin_indices]
+        p_end = self.ref_buffer['trans'][end_indices]
+        cyclic_lin_xyz_diff = p_end - p_begin
+        cyclic_lin_xyz_diff_local = quat_apply(quat_inv(q_begin), cyclic_lin_xyz_diff)
+        final_pos_out = wp.zeros(self.num_envs, dtype=wp.vec3, device=self.device)
+        final_quat_out = wp.zeros(self.num_envs, dtype=wp.quat, device=self.device)
+        
+        trans_buffer_wp = wp.from_torch(self.ref_buffer['trans'], dtype=wp.vec3)
+        quat_buffer_wxyz = self.ref_buffer['target_quaternion']
+        quat_buffer_xyzw = quat_buffer_wxyz.roll(shifts=-1, dims=-1).contiguous()
+        quat_buffer_wp = wp.from_torch(quat_buffer_xyzw, dtype=wp.quat)
+        
+        wp.launch(
+            kernel=self.compute_cumulative_pose,
+            dim=self.num_envs,
+            inputs=[
+                final_pos_out, final_quat_out,
+                trans_buffer_wp, quat_buffer_wp,
+                wp.from_torch((current_indices).to(torch.int32)),
+                wp.from_torch((begin_indices).to(torch.int32)),
+                wp.from_torch((current_num_cyclic_subseq).to(torch.int32)),
+                wp.from_torch(to_xyzw(cyclic_quat_diff), dtype=wp.quat),
+                wp.from_torch(cyclic_lin_xyz_diff_local, dtype=wp.vec3)
+                
+            ],
+        device=self.device
+        )
+        final_pos = wp.to_torch(final_pos_out).to(self.device)
+        final_quat_xyzw = wp.to_torch(final_quat_out).to(self.device)
+        final_quat = to_wxyz(final_quat_xyzw)
+            
+        return final_pos, final_quat
+        
+    @wp.kernel
+    def compute_cumulative_quat(
+        final_quat_out: wp.array(dtype=wp.quat),
+        quat_buffer: wp.array(dtype=wp.quat), 
+        current_indices: wp.array(dtype=wp.int32),
+        begin_indices: wp.array(dtype=wp.int32),
+        current_num_cyclic_subseq: wp.array(dtype=wp.int32),
+        cyclic_quat_diff: wp.array(dtype=wp.quat)
+    ):
+        """
+        CUDA kernel to compute cumulative quaternion observations with cyclic subsequence support.
+        
+        For each environment:
+        - If current_idx < begin_idx: directly return quaternion at current_idx
+        - Otherwise: accumulate quaternion rotations through cycles and current partial cycle
+        
+        Args:
+            final_quat_out: Output quaternions for each environment
+            quat_buffer: Buffer containing quaternion data
+            current_indices: Current time indices for each environment  
+            begin_indices: Start indices of cyclic subsequence for each environment
+            current_num_cyclic_subseq: Number of completed cycles for each environment
+            cyclic_quat_diff: Quaternion difference over one complete cycle
+        """
+        tid = wp.tid()
+
+        c_idx = current_indices[tid]
+        b_idx = begin_indices[tid]
+        num_cycles = current_num_cyclic_subseq[tid]
+        
+        if c_idx < b_idx:
+            # Before cyclic region: direct lookup
+            final_quat_out[tid] = quat_buffer[c_idx]
+        else:
+            # Within cyclic region: accumulate rotations
+            
+            # Start with quaternion at beginning of cycle
+            accumulated_quat = quat_buffer[b_idx]
+
+            # Apply complete cycle rotations
+            i = wp.int32(0)
+            while i < num_cycles:
+                accumulated_quat = quat_mul_wp(accumulated_quat, cyclic_quat_diff[tid])
+                i += 1
+
+            # Apply partial cycle rotation (from begin to current position)
+            q_current_in_cycle = quat_buffer[c_idx]
+            q_begin_in_cycle = quat_buffer[b_idx]
+            q_diff_in_cycle = quat_mul_wp(q_current_in_cycle, wp.quat_inverse(q_begin_in_cycle))
+            
+            accumulated_quat = quat_mul_wp(accumulated_quat, q_diff_in_cycle)
+            final_quat_out[tid] = accumulated_quat
+    
+    def calculate_quat_obs(self, key, current_time: torch.Tensor):
+        """
+        Calculate quaternion observations with cyclic subsequence support.
+        
+        This function computes quaternion values at given time points, handling:
+        - Direct lookup for times before cyclic region
+        - Cumulative quaternion multiplication for times within cyclic region
+        - Proper quaternion accumulation across multiple cycles
+        
+        Args:
+            key: Key name for quaternion buffer (e.g., 'target_quaternion')
+            current_time: Time tensor of shape (num_envs,)
+            
+        Returns:
+            torch.Tensor: Quaternion observations of shape (num_envs, 4) in w,x,y,z format
+        """
+        assert key in self.ref_buffer.keys(), f"Key '{key}' not found in reference buffer"
+        
+        # Helper functions for quaternion format conversion between PyTorch (w,x,y,z) and Warp (x,y,z,w)
+        def to_xyzw(q_wxyz):
+            """Convert quaternion from w,x,y,z to x,y,z,w format"""
+            return q_wxyz.roll(shifts=-1, dims=-1).contiguous()
+        
+        def to_wxyz(q_xyzw):
+            """Convert quaternion from x,y,z,w to w,x,y,z format"""
+            return q_xyzw.roll(shifts=1, dims=-1).contiguous()
+        
+        # Get cyclic subsequence information
+        current_num_cyclic_subseq, current_idx, current_begin_idx, current_end_idx = self.calc_num_cyclic_subseq(current_time)
+        
+        begin_indices = current_begin_idx  # shape: (num_envs,)
+        end_indices = current_end_idx      # shape: (num_envs,)
+        current_indices = current_idx      # shape: (num_envs,)
+        
+        # Calculate quaternion difference over one complete cycle
+        q_begin = self.ref_buffer[key][begin_indices]  # shape: (num_envs, 4)
+        q_end = self.ref_buffer[key][end_indices]      # shape: (num_envs, 4)
+        cyclic_quat_diff = quat_mul(q_end, quat_inv(q_begin))  # Quaternion representing one cycle rotation
+        
+        # Prepare output tensor and convert quaternion buffer to warp format
+        final_quat_out = wp.zeros(self.num_envs, dtype=wp.quat, device=self.device)
+        
+        quat_buffer_wxyz = self.ref_buffer[key]  # PyTorch format: w,x,y,z
+        quat_buffer_xyzw = to_xyzw(quat_buffer_wxyz)  # Convert to Warp format: x,y,z,w
+        quat_buffer_wp = wp.from_torch(quat_buffer_xyzw, dtype=wp.quat)
+        
+        # Launch CUDA kernel for parallel computation
+        wp.launch(
+            kernel=self.compute_cumulative_quat,
+            dim=self.num_envs,
+            inputs=[
+                final_quat_out,
+                quat_buffer_wp,
+                wp.from_torch(current_indices.to(torch.int32)),
+                wp.from_torch(begin_indices.to(torch.int32)),
+                wp.from_torch(current_num_cyclic_subseq.to(torch.int32)),
+                wp.from_torch(to_xyzw(cyclic_quat_diff), dtype=wp.quat)
+            ],
+            device=self.device
+        )
+        
+        # Convert result back to PyTorch format
+        final_quat_xyzw = wp.to_torch(final_quat_out).to(self.device)
+        final_quat = to_wxyz(final_quat_xyzw)  # Convert back to w,x,y,z format
+            
+        return final_quat
+    
     def calc_base_pose_cumulative(self, current_time: torch.Tensor, lin_vel_name: str, ang_vel_name: str):
         dt = 1.0 / self.frame_rate[self.env_ref_id]
         
         # ang_pos = self.calc_cumulative_obs_v2(ang_vel_name, current_time) * dt.unsqueeze(1)
         try:
-            lin_pos, ang_pos = self.calc_base_pose_from_trans_orient(current_time)
-        
+            lin_pos, base_quat = self.calc_base_pose_from_trans_quat(current_time)
         except:
-            lin_pos, ang_pos = self.calc_cumulative_obs_v2_lin_pos(lin_vel_name, ang_vel_name, current_time)# * dt.unsqueeze(1)
-            lin_pos *= dt.unsqueeze(1)
-            lin_pos[..., 2] += self.env_origin_z[self.env_ref_id]  # Adjust for environment origin z
+            try:
+                lin_pos, ang_pos = self.calc_base_pose_from_trans_orient(current_time)
+            
+            except:
+                lin_pos, ang_pos = self.calc_cumulative_obs_v2_lin_pos(lin_vel_name, ang_vel_name, current_time)# * dt.unsqueeze(1)
+                lin_pos *= dt.unsqueeze(1)
+                lin_pos[..., 2] += self.env_origin_z[self.env_ref_id]  # Adjust for environment origin z
 
             # normalize ang_pos to 0~2pi
-        ang_pos = ang_pos % (2 * np.pi)
-        # base_quat = angle_axis_to_quaternion(ang_pos)
-        base_quat = quat_from_euler_xyz(*ang_pos.T)                
+            ang_pos = ang_pos % (2 * np.pi)
+            # base_quat = angle_axis_to_quaternion(ang_pos)
+            base_quat = quat_from_euler_xyz(*ang_pos.T)                
         return torch.cat([lin_pos, base_quat], dim=1)

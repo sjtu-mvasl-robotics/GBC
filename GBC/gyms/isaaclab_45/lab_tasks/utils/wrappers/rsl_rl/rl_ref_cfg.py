@@ -62,9 +62,9 @@ class RslRlRefPpoAlgorithmCfg:
     max_lr: float = 1e-2
     min_lr: float = 1e-4
     max_lr_after_certain_epoch: float = 1e-3
-    max_lr_restriction_epoch: int = 5000
+    max_lr_restriction_epoch: int = 2500
     min_lr_after_certain_epoch: float = 1e-5
-    min_lr_restriction_epoch: int = 5000
+    min_lr_restriction_epoch: int = 2500
     
     # beginning of MMPPO config
     num_learning_epochs: int = MISSING

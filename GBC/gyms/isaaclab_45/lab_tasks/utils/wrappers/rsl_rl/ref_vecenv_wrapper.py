@@ -10,6 +10,10 @@ from GBC.gyms.isaaclab_45.managers import ref_obs_type
 class RslRlReferenceVecEnvWrapper(RslRlVecEnvWrapper):
     def __init__(self, env: ManagerBasedRefRLEnv):
         super().__init__(env)
+        
+    # def get_observations(self) -> tuple[torch.Tensor, dict]:
+    #     obs_dict = self.unwrapped.observation_manager.compute()
+    #     return obs_dict["policy"], {"observations": obs_dict}
 
     def get_reference_observations(self) -> tuple[ref_obs_type, dict]:
         cur_time = self.unwrapped.episode_length_buf.to(torch.float32) * self.unwrapped.step_dt

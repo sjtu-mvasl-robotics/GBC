@@ -98,6 +98,10 @@ class RefObservationManager(ManagerBase):
         return self._group_ref_obs_concatenate
     
     @property
+    def group_ref_obs_term_cfgs(self):
+        return self._group_ref_obs_term_cfgs
+    
+    @property
     def group_ref_obs_term_buffer(self):
         return self._group_ref_obs_term_buffer_manager
     
@@ -123,7 +127,7 @@ class RefObservationManager(ManagerBase):
             ref_obs[group_name] = self.compute_group(group_name, cur_time, symmetry)
         return ref_obs
     
-    def compute_policy_symmetry(self, ref_observations_tuple: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def compute_policy_symmetry(self, ref_observations_tuple: tuple[torch.Tensor, torch.Tensor], history_length: int = 1) -> torch.Tensor:
         assert "policy" in self._group_ref_obs_term_names, "policy group is not defined, cannot compute policy symmetry"
         group_term_names = self._group_ref_obs_term_names["policy"]
         group_term_cfgs = self._group_ref_obs_term_cfgs["policy"]
@@ -147,6 +151,13 @@ class RefObservationManager(ManagerBase):
             else:
                 if term_cfg.history_length > 0 and term_cfg.flatten_history_dim:
                     target_obs = ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]].reshape(-1, term_cfg.history_length, group_term_dim[i][-1] // term_cfg.history_length)
+                    target_obs = term_cfg.symmetry(self._env, target_obs, **term_cfg.symmetry_params)
+                    target_obs = target_obs.reshape(ref_observations.shape[0], -1)
+                    if symmetry_ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]].shape != target_obs.shape:
+                        target_obs = target_obs.reshape(symmetry_ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]].shape)
+                    symmetry_ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]] = target_obs
+                elif history_length > 1: # force flat history dim
+                    target_obs = ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]].reshape(-1, history_length, group_term_dim[i][-1] // history_length)
                     target_obs = term_cfg.symmetry(self._env, target_obs, **term_cfg.symmetry_params)
                     target_obs = target_obs.reshape(ref_observations.shape[0], -1)
                     symmetry_ref_observations[..., group_term_concatenate_last_dim[i]:group_term_concatenate_last_dim[i+1]] = target_obs
@@ -196,7 +207,14 @@ class RefObservationManager(ManagerBase):
                 buf_manager = self._group_ref_obs_term_buffer_manager[group_name]
                 if term_cfg.is_base_pose:
                     return buf_manager.calc_base_pose_cumulative(cp_cur_time, term_cfg.params["lin_vel_name"], term_cfg.params["ang_vel_name"]), buf_manager.calc_mask(cp_cur_time)
-                obs, mask = buf_manager.calc_obs(term_name, cp_cur_time), buf_manager.calc_mask(cp_cur_time)
+                if term_cfg.steps > 1:
+                    obs, mask = buf_manager.calc_obs_multi_step(term_name, cp_cur_time, term_cfg.steps), buf_manager.calc_mask(cp_cur_time)
+                    if term_cfg.sample_rate > 1:
+                        obs = obs[:, ::term_cfg.sample_rate, ...]
+                    obs = obs.reshape(obs.shape[0], -1)
+                    mask = mask.all(dim=1)
+                else:
+                    obs, mask = buf_manager.calc_obs(term_name, cp_cur_time), buf_manager.calc_mask(cp_cur_time)
                 if term_cfg.modifiers is not None:
                     for mod in term_cfg.modifiers:
                         obs = mod.func(obs, **mod.params)
@@ -210,6 +228,7 @@ class RefObservationManager(ManagerBase):
                 # apply scaling
                 if term_cfg.scale is not None:
                     obs = obs.mul_(term_cfg.scale)
+                
                         
                 if term_cfg.env_func is not None:
                     func, func_params = term_cfg.env_func, term_cfg.env_func_params
@@ -296,17 +315,28 @@ class RefObservationManager(ManagerBase):
         group_ref_obs = dict.fromkeys(group_term_names, None)
         obs_terms = zip(group_term_names, self._group_ref_obs_term_cfgs[group_name])
         obs_mask: torch.Tensor | None = None
+        base_pos_obs: torch.Tensor | None = None
         for term_name, term_cfg in obs_terms:
             term_delay = self._group_ref_obs_init_delay[group_name][self._group_ref_obs_term_names[group_name].index(term_name)]
             cp_cur_time = torch.clamp(cur_time - term_delay, min=0.0)
             if term_cfg.is_base_pose:
-                obs = group_buffer_manager.calc_base_pose(
-                    cp_cur_time,
-                    term_cfg.params["lin_vel_name"],
-                    term_cfg.params["ang_vel_name"],
-                )
+                if base_pos_obs is None:
+                    obs = group_buffer_manager.calc_base_pose(
+                        cp_cur_time,
+                        term_cfg.params["lin_vel_name"],
+                        term_cfg.params["ang_vel_name"],
+                    )
+                    base_pos_obs = obs # cache base pos obs, since this calculation is done through integration and is expensive
+                else:
+                    obs = base_pos_obs
             else:
-                obs = group_buffer_manager.calc_obs(term_name, cp_cur_time)
+                if term_cfg.steps > 1:
+                    obs = group_buffer_manager.calc_obs_multi_step(term_name, cp_cur_time, term_cfg.steps)
+                    if term_cfg.sample_rate > 1:
+                        obs = obs[:, ::term_cfg.sample_rate, ...]
+                    obs = obs.reshape(obs.shape[0], -1)
+                else:
+                    obs = group_buffer_manager.calc_obs(term_name, cp_cur_time)
             if obs_mask is None and not term_cfg.make_empty:
                 obs_mask = group_buffer_manager.calc_mask(cp_cur_time)
             # apply modifiers
@@ -315,6 +345,7 @@ class RefObservationManager(ManagerBase):
                     obs = mod.func(obs, **modifiers.params)
             # apply noise
             if term_cfg.noise is not None:
+                # print(f"Applying noise to term {term_name}")
                 obs = term_cfg.noise.func(obs, term_cfg.noise)
             # apply clipping
             if term_cfg.clip is not None:
@@ -431,6 +462,8 @@ class RefObservationManager(ManagerBase):
                         raise ValueError(f"Invalid term name {term_real_name} in term {term_name}. Expected term name in the pickle file.")
                     data = pkl[term_real_name]
                     data = data.to(self.device)
+                if term_name == 'target_joint_pos_diff':
+                    print("here")
                 if term_cfg.func is not None:
                     data = term_cfg.func(data, env=self._env, pickle_cfg = {"fps": pkl["fps"]}, **term_cfg.params)
 
@@ -439,11 +472,17 @@ class RefObservationManager(ManagerBase):
                 buffer_manager.add_reference(term_name, ref_id, data, term_cfg.is_constant, pkl["fps"], cyclic_subseq=pkl["cyclic_subseq"])
             buffer_manager.prepare_buffers(term_name)
             ref_obs_dims = (0,) if not term_cfg.in_obs_tensor or term_cfg.make_empty else buffer_manager.get_dim(term_name)
-            if term_cfg.env_func is not None:
-                num_envs = self._env.num_envs
-                dummy_obs = torch.zeros((num_envs, *ref_obs_dims), device=self._env.device)
-                dummy_obs = term_cfg.env_func(self._env, dummy_obs, **term_cfg.env_func_params)
-                ref_obs_dims = dummy_obs.shape[1:]
+            
+        if term_cfg.steps > 1 and term_cfg.in_obs_tensor: 
+            ref_obs_dims = list(ref_obs_dims)
+            ref_obs_dims[0] = ref_obs_dims[0] * term_cfg.steps // term_cfg.sample_rate
+            ref_obs_dims = tuple(ref_obs_dims)
+            
+        if term_cfg.env_func is not None and term_cfg.in_obs_tensor:
+            num_envs = self._env.num_envs
+            dummy_obs = torch.zeros((num_envs, *ref_obs_dims), device=self._env.device)
+            dummy_obs = term_cfg.env_func(self._env, dummy_obs, **term_cfg.env_func_params) # even if return is NaN, shape should be correct
+            ref_obs_dims = dummy_obs.shape[1:]
         
         if term_cfg.history_length > 0:
             old_dims = list(ref_obs_dims)

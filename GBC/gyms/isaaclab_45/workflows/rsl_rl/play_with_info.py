@@ -57,7 +57,7 @@ from rsl_rl.runners import OnPolicyRunnerMM
 
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.dict import print_dict
-from isaaclab.markers import VisualizationMarkers, FRAME_MARKER_CFG
+from isaaclab.markers import VisualizationMarkers, FRAME_MARKER_CFG, RED_ARROW_X_MARKER_CFG
 from isaaclab.managers import SceneEntityCfg
 
 import isaaclab_tasks  # noqa: F401
@@ -232,14 +232,20 @@ class RefBasePoseLogger:
         self.marker_cfg = FRAME_MARKER_CFG.replace(
             prim_path="/World/Marker",
         )
+        self.marker2_cfg = RED_ARROW_X_MARKER_CFG.replace(
+            prim_path="/World/Marker2",
+        )
         self.marker = VisualizationMarkers(self.marker_cfg)
+        self.marker2 = VisualizationMarkers(self.marker2_cfg)
 
     def step(self):
         pose, mask = self.env.unwrapped.ref_observation_manager.get_term("target_base_pose")
+        quat_compute, _ = self.env.unwrapped.ref_observation_manager.get_term("target_quaternion")
         pose = pose[mask]
         pos, quat = pose[:, :3], pose[:, 3:7]
-        pos = pos + self.env.unwrapped.scene.env_origins
-        self.marker.visualize(translations=pos, orientations=quat)
+        # pos = pos + self.env.unwrapped.scene.env_origins
+        # self.marker.visualize(translations=pos, orientations=quat)
+        # self.marker2.visualize(translations=pos, orientations=quat_compute[mask])
 
     def print_info(self):
         print("No information")
@@ -305,35 +311,36 @@ def main():
     # )
 
     loggers = []
-    if args_cli.enable_feet_logger:
-        loggers.append(FeetContactLogger(
-            env,
-            SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-            # SceneEntityCfg("contact_forces", body_names=["left_ankle_link", "right_ankle_link"]),
-        )) 
-    if args_cli.enable_ref_action_logger:
-        loggers.append(RefActionLogger(
-            env,
-            SceneEntityCfg("robot", joint_names=[ ".*" ]),
-        ))
-    if args_cli.save_robot_data:
-        loggers.append(SaveRobotDataLogger(
-            env,
-            SceneEntityCfg("robot"),
-        ))
-    if True:
-        loggers.append(ActionRateAccLogger(
-            env,
-            SceneEntityCfg("robot"),
-        ))
-    if True:
-        loggers.append(RefBasePoseLogger(
-            env,
-        ))
+    # if args_cli.enable_feet_logger:
+    #     loggers.append(FeetContactLogger(
+    #         env,
+    #         SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
+    #         # SceneEntityCfg("contact_forces", body_names=["left_ankle_link", "right_ankle_link"]),
+    #     )) 
+    # if args_cli.enable_ref_action_logger:
+    #     loggers.append(RefActionLogger(
+    #         env,
+    #         SceneEntityCfg("robot", joint_names=[ ".*" ]),
+    #     ))
+    # if args_cli.save_robot_data:
+    #     loggers.append(SaveRobotDataLogger(
+    #         env,
+    #         SceneEntityCfg("robot"),
+    #     ))
+    # if True:
+    #     loggers.append(ActionRateAccLogger(
+    #         env,
+    #         SceneEntityCfg("robot"),
+    #     ))
+    # if True:
+    #     loggers.append(RefBasePoseLogger(
+    #         env,
+    #     ))
 
     # reset environment
     obs, _ = env.get_observations()
     ref_obs, _ = env.get_reference_observations()
+    # ref_obs=None
     timestep = 0
     # simulate environment
     while simulation_app.is_running():

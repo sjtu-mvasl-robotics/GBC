@@ -141,9 +141,11 @@ def symmetry_by_term_name(env: ManagerBasedRLEnv, inputs: torch.Tensor, term_nam
     raise NotImplementedError("Symmetry by term name is not implemented for ManagerBasedRLEnv.")
 
 
-def get_ref_observation_symmetry(env: ManagerBasedRefRLEnv, ref_observations: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+def get_ref_observation_symmetry(env: ManagerBasedRefRLEnv, ref_observations: tuple[torch.Tensor, torch.Tensor], history_length: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
     """Get the symmetry of the reference observation."""
-    return env.unwrapped.ref_observation_manager.compute_policy_symmetry(ref_observations)
+    if history_length == 0:
+        history_length = 1
+    return env.unwrapped.ref_observation_manager.compute_policy_symmetry(ref_observations, history_length=history_length)
 
 
 ###################################################################################################
@@ -156,9 +158,9 @@ def reference_actions_diff(env: ManagerBasedRefRLEnv, actions: torch.Tensor, his
     """Compute the actions difference between asset joint pos and actions."""
     asset = env.scene[asset_cfg.name]
     joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
-    actions = actions.reshape(-1, history_length, actions.shape[-1] // history_length)
-    actions_last = actions[:, -1, :]
-    actions = actions_last
+    # actions = actions.reshape(-1, history_length, actions.shape[-1] // history_length)
+    # actions_last = actions[:, -1, :]
+    # actions = actions_last
     diff = torch.abs(joint_pos - actions)
     diff = diff.reshape(actions.shape[0], -1)
     return diff
@@ -167,9 +169,9 @@ def reference_quaternion_diff(env: ManagerBasedRefRLEnv, ref_quaternions: torch.
     """Compute the quaternion difference between asset and reference."""
     asset: Articulation = env.scene[asset_cfg.name]
     base_quat = asset.data.root_quat_w
-    ref_quaternions = ref_quaternions.reshape(-1, history_length, ref_quaternions.shape[-1] // history_length)
-    ref_quaternions_last = ref_quaternions[:, -1, :]
-    ref_quaternions = ref_quaternions_last
+    # ref_quaternions = ref_quaternions.reshape(-1, history_length, ref_quaternions.shape[-1] // history_length)
+    # ref_quaternions_last = ref_quaternions[:, -1, :]
+    # ref_quaternions = ref_quaternions_last
     quat_diff = quat_error_magnitude(base_quat, ref_quaternions)
     return quat_diff.unsqueeze(-1) # shape (num_envs, 1)
 
@@ -178,17 +180,17 @@ def reference_projected_gravity_diff(env: ManagerBasedRefRLEnv, ref_projected_gr
     asset = env.scene[asset_cfg.name]
     base_proj_gravity = asset.data.projected_gravity_b
     # measure gravity diff using cosine distance
-    ref_projected_gravity = ref_projected_gravity.reshape(-1, history_length, ref_projected_gravity.shape[-1] // history_length)
-    ref_projected_gravity_last = ref_projected_gravity[:, -1, :]
-    ref_projected_gravity = ref_projected_gravity_last
+    # ref_projected_gravity = ref_projected_gravity.reshape(-1, history_length, ref_projected_gravity.shape[-1] // history_length)
+    # ref_projected_gravity_last = ref_projected_gravity[:, -1, :]
+    # ref_projected_gravity = ref_projected_gravity_last
     cross = torch.cross(base_proj_gravity, ref_projected_gravity, dim=-1)
     return cross
 
 def reference_link_pose_diff(env: ManagerBasedRefRLEnv, ref_link_poses: torch.Tensor, history_length: int = 1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), **kwargs) -> torch.Tensor:
     """Compute the link pose difference between asset link poses and reference link poses."""
     cur_body_pos = compute_actual_body_pose_robot_frame(env, asset_cfg)
-    ref_link_poses = ref_link_poses.reshape(-1, history_length, ref_link_poses.shape[-1] // history_length)
-    ref_link_poses = ref_link_poses[:, -1, :]
+    # ref_link_poses = ref_link_poses.reshape(-1, history_length, ref_link_poses.shape[-1] // history_length)
+    # ref_link_poses = ref_link_poses[:, -1, :]
     pos_diff = cur_body_pos[..., :3] - ref_link_poses[..., :3]
     quat_diff = quat_error_magnitude(cur_body_pos[..., 3:7], ref_link_poses[..., 3:7])
     diff = torch.cat([pos_diff, quat_diff.unsqueeze(-1)], dim=-1)
@@ -201,7 +203,7 @@ def reference_link_pose_diff(env: ManagerBasedRefRLEnv, ref_link_poses: torch.Te
 ###################################################################################################
 
         
-def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.0, ref_name: str | None = None) -> torch.Tensor:
+def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.0, ref_name: str | None = None, adaptive_phase: bool = False) -> torch.Tensor:
     """Get the phase of the robot. The phase is calculated as the time since the start of the episode divided by the period, and then wrapped to [0, 1]."""
         
     ref_phase = None
@@ -211,11 +213,21 @@ def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.
             if hasattr(env.unwrapped, "ref_observation_manager") and ref_name is not None:
                 ref_phase, mask = env.unwrapped.ref_observation_manager.get_term(ref_name)
         except:
-            pass
+            mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+            ref_phase = cur_time % period / period
     else:
         # episode_length_buf unavailable at initializing observations
         cur_time = torch.zeros((env.num_envs, 1), dtype=torch.float32, device=env.device)
-    phase = cur_time % period / period
+        
+    if adaptive_phase:
+        # adapt phase period based on base velocity command
+        velocity_commands = env.command_manager.get_command("base_velocity")
+        lin_vel = velocity_commands[:, 0:2].norm(dim=-1) # (num_envs,)
+        # adaptive period between 0.4s to 2.0s
+        period = 2.0 - torch.clamp(lin_vel / 1.5, min=0.0, max=1.0) * 1.6 # (num_envs,)
+        period = period.unsqueeze(1) # (num_envs, 1)
+    
+    phase = cur_time % period / period 
     phase = (phase + offset) % 1
     
     
@@ -224,6 +236,34 @@ def get_phase(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.
         phase = torch.where(mask.unsqueeze(1), ref_phase, phase)
     return phase
 
+
+def get_phase_direct(env: ManagerBasedRefRLEnv, period: float = 0.8, offset: float = 0.0, ref_name: str | None = None, adaptive_phase: bool = False) -> torch.Tensor:
+    """Get the phase of the robot. The phase is calculated as the time since the start of the episode divided by the period, and then wrapped to [0, 1]."""
+        
+    ref_phase = None
+    if hasattr(env.unwrapped, "episode_length_buf"):
+        cur_time = env.episode_length_buf.unsqueeze(1).to(torch.float32) * env.step_dt
+        try:
+            if hasattr(env.unwrapped, "ref_observation_manager") and ref_name is not None:
+                ref_phase, mask = env.unwrapped.ref_observation_manager.get_term(ref_name)
+        except:
+            mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+            ref_phase = cur_time % period / period
+    else:
+        # episode_length_buf unavailable at initializing observations
+        cur_time = torch.zeros((env.num_envs, 1), dtype=torch.float32, device=env.device)
+        
+    if adaptive_phase:
+        # adapt phase period based on base velocity command
+        velocity_commands = env.command_manager.get_command("base_velocity")
+        lin_vel = velocity_commands[:, 0:2].norm(dim=-1) # (num_envs,)
+        # adaptive period between 0.4s to 2.0s
+        period = 2.0 - torch.clamp(lin_vel / 1.5, min=0.0, max=1.0) * 1.6 # (num_envs,)
+        period = period.unsqueeze(1) # (num_envs, 1)
+    
+    phase = cur_time % period / period 
+    phase = (phase + offset) % 1
+    return phase
 
 
 ###################################################################################################
@@ -266,6 +306,16 @@ def body_link_gravity_projection_exceed_threshold(env: ManagerBasedRLEnv, thresh
     cos_diff = 1 - body_z[:, 2] # (num_envs,)
     return cos_diff > threshold
     
+    
+def base_too_far_from_reference(env: ManagerBasedRefRLEnv, max_dist: float = 5.0, asset_cfg:SceneEntityCfg = SceneEntityCfg("robot")):
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_pose = asset.data.root_pos_w[:, 0:3]
+    target, mask = env.ref_observation_manager.get_term("target_base_pose")
+    target_xyz = target[:, 0:3]
+    xyz_dist = torch.norm((target_xyz-root_pose), p=2, dim=-1) # shape
+    xyz_dist = torch.where(mask, xyz_dist, torch.zeros_like(xyz_dist))
+    return xyz_dist > max_dist
+    
 
 ###################################################################################################
 
@@ -280,18 +330,19 @@ def joint_pos_l2(env: ManagerBasedRefRLEnv, asset_cfg: SceneEntityCfg = SceneEnt
 
 def phase_feet_contact(env, period: float, sensor_cfg: SceneEntityCfg, contact_phase_thresh: float = 0.55, contact_time_thresh = 0.01, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Reward the agent for tracking the target feet contact."""
-    if hasattr(env.unwrapped, "episode_length_buf"):
-        cur_time = env.episode_length_buf.to(torch.float32) * env.step_dt
-    else:
-        # episode_length_buf unavailable at initializing observations
-        cur_time = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
-    leg_phase = torch.stack([
-        cur_time % period / period,
-        (cur_time + period / 2) % period / period,
-    ])
-    leg_phase = leg_phase.transpose(0, 1)
-    assert leg_phase.shape == (env.num_envs, 2)
-    target_feet_contact = leg_phase < contact_phase_thresh
+    # if hasattr(env.unwrapped, "episode_length_buf"):
+    #     cur_time = env.episode_length_buf.to(torch.float32) * env.step_dt
+    # else:
+    #     # episode_length_buf unavailable at initializing observations
+    #     cur_time = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+    # leg_phase = torch.stack([
+    #     (cur_time % period) / period,
+    #     ((cur_time + period / 2) % period) / period,
+    # ])
+    # leg_phase = leg_phase.transpose(0, 1)
+    # assert leg_phase.shape == (env.num_envs, 2)
+    # target_feet_contact = leg_phase < contact_phase_thresh
+    target_feet_contact, _ = calc_target_feet_contact(env, phase_thresh=contact_phase_thresh, period=period)
 
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     has_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > contact_time_thresh
@@ -307,8 +358,8 @@ def phase_feet_contact(env, period: float, sensor_cfg: SceneEntityCfg, contact_p
     reward = (target_feet_contact == has_contact)
     penalty = (target_feet_contact != has_contact)
     has_parallel_contact = is_parallel & has_contact
-    has_parallel_contact_reward = has_parallel_contact * reward
-    return torch.sum(reward.float(), dim=1) + torch.sum(has_parallel_contact_reward.float(), dim=1) * 0.75 - 0.5 * torch.sum(penalty.float(), dim=1)
+    has_parallel_contact_reward = has_parallel_contact & reward
+    return torch.sum(reward.float(), dim=1) + torch.sum(has_parallel_contact_reward.float(), dim=1) * 0.5 - 0.1 * torch.sum(penalty.float(), dim=1)
 
 def contact_no_vel(env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg, contact_time_thresh: float = 0.01) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
@@ -348,11 +399,12 @@ def reference_action_reshape(inputs, env: ManagerBasedRLEnv, urdf_path: str, ass
     robot_kinematics = RobotKinematics(urdf_path=urdf_path, device=env.device)
     orig_order = robot_kinematics.get_dof_names()
     targ_order = env.scene[asset_cfg.name].joint_names
-    inputs = inputs[:, [orig_order.index(j) for j in targ_order]]
+    inputs = inputs[..., [orig_order.index(j) for j in targ_order]]
     if add_default_joint_pos:
         default_joint_pos = env.scene[asset_cfg.name].data.default_joint_pos
         inputs = inputs + default_joint_pos[0] # take first dimension since it is the same for all dimensions
     return inputs
+
 
 def reference_action_std(inputs, env: ManagerBasedRLEnv, urdf_path: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), pickle_cfg = {}, add_default_joint_pos = False):
     """Calculate the std of reshaped actions"""
@@ -369,17 +421,12 @@ def reference_rotation_refine(input, env: ManagerBasedRLEnv, pikle_cfg = {}):
 def reference_root_quat_from_rot(input, env: ManagerBasedRLEnv, pickle_cfg = {}):
     """Convert the reference root orientation from rotation vector to quaternion."""
     input = quat_from_matrix(rot_vec_to_mat(input))
-    # input = quat_fix(input)
-    # try:
-    #     input = smooth_quat_savgol(input, window_size=11, poly_order=3)
-    # except: # len of input < window_size
-    #     carb.log_warn("Failed to smooth the reference root orientation.")
     return input
     
 
 def reference_action_velocity(input, env: ManagerBasedRLEnv, urdf_path: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), pickle_cfg = {}):
     reshaped_actions = reference_action_reshape(input, env, urdf_path, asset_cfg, pickle_cfg)
-    action_vel = torch.cat([torch.zeros_like(reshaped_actions[0:1, :]), torch.diff(reshaped_actions, dim=0)], dim=0) * pickle_cfg["fps"]
+    action_vel = torch.cat([torch.zeros_like(reshaped_actions[..., 0:1, :]), torch.diff(reshaped_actions, dim=-2)], dim=-2) * pickle_cfg["fps"]
     return action_vel
 
 
@@ -405,10 +452,23 @@ def relative_feet_height(env, command_name: str, asset_cfg: SceneEntityCfg = Sce
     command = env.command_manager.get_command(command_name)
     return feet_height * (torch.norm(command[:, :2], dim=1) >= 0.1).float()
 
+def relative_base_height(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Reward the agent for keeping the base at a relative height."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_height = asset.data.root_pos_w[:, 2]  # z (world frame)
+    link_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # z (world frame)
+    link_pos_min = torch.min(link_pos, dim=-1).values
+    rel_base_height = base_height - link_pos_min
+    base_height = asset.cfg.init_state.pos[2] # base height
+    base_height_diff = base_height - rel_base_height
+    base_height_diff = torch.where(base_height_diff < 0, torch.zeros_like(base_height_diff), base_height_diff)
+
+    return - torch.square(base_height_diff)
+
 
 def reference_feet_contact_phase(input, env: ManagerBasedRLEnv, index: int, offset: float = 0.0, threshold: float = 0.55, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), pickle_cfg = {}):
     """Get the feet contact phase from the reference data."""
-    contact = input[:, index]
+    contact = input[..., index]
     phase = contact_to_phase(contact, threshold=threshold)
     phase = (phase + offset) % 1
     return torch.sin(phase * 2 * torch.pi).unsqueeze(1)
@@ -469,6 +529,13 @@ def reference_projected_gravity(env: ManagerBasedRefRLEnv, asset_cfg: SceneEntit
     reference_projected_gravity, ref_projected_gravity_mask = env.ref_observation_manager.get_term("target_projected_gravity")
     reference_projected_gravity = torch.where(ref_projected_gravity_mask.unsqueeze(1), reference_projected_gravity, projected_gravity_b)
     return reference_projected_gravity
+
+def reference_root_quat_w(env: ManagerBasedRefRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    asset = env.scene[asset_cfg.name]
+    root_quat_w = asset.data.root_quat_w
+    reference_root_quat, ref_root_quat_mask = env.ref_observation_manager.get_term("target_quaternion")
+    reference_root_quat = torch.where(ref_root_quat_mask.unsqueeze(1), reference_root_quat, root_quat_w)
+    return reference_root_quat
 
 
 def feet_height_flat(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -586,11 +653,13 @@ def randomize_initial_start_time(
 
     This function accepts a ratio between 0 and 1. For sampled environments, the imitation reads the data sequence starting from episode_length * ratio.
     """
-    if not isinstance(env, ManagerBasedRefRLEnv):
-        raise RuntimeError("This function can only be used for `ManagerBasedRefRLEnv`.")
+    # if not isinstance(env, ManagerBasedRefRLEnv):
+    #     raise RuntimeError("This function can only be used for `ManagerBasedRefRLEnv`.")
     epi_len = env.max_episode_length_s # in seconds
     # randomized_sample_time = torch.random.uniform(0, 1, size=(env.num_envs,), device=env.device) * epi_len * (1 - sample_episode_ratio) + epi_len * sample_episode_ratio
-    randomized_sample_time = torch.rand(env.num_envs, device=env.device) * epi_len * sample_episode_ratio
+    # randomized_sample_time = torch.rand(env.num_envs, device=env.device) * epi_len * sample_episode_ratio
+    randomized_sample_time = torch.rand(env.num_envs, device=env.device) * 10.0
+    # randomized_sample_time = torch.zeros(env.num_envs, device=env.device)
     env.unwrapped.ref_observation_manager.start_time[env_ids] = randomized_sample_time[env_ids]
 
 def reset_root_state_by_start_time(
@@ -615,9 +684,10 @@ def reset_root_state_by_start_time(
     root_lin_velocities, _ = env.ref_observation_manager.compute_term("base_lin_vel", torch.zeros(env.num_envs, dtype=torch.float32).to(env.device))
     root_ang_velocities, mask = env.ref_observation_manager.compute_term("base_ang_vel", torch.zeros(env.num_envs, dtype=torch.float32).to(env.device))
     # root_orientations = angle_axis_to_quaternion(root_orientations)
-    # root_positions += env.scene.env_origins
+    
 
     root_positions = base_pose_w[:, :3]
+    # root_positions += env.scene.env_origins
     # root_xy_delta = root_positions[:, :3] - original_root_states[:, :3]
     # root_xy_delta[:, 2] = 0.0
     # root_positions = original_root_states[:, :3] + root_xy_delta + env.scene.env_origins
@@ -1209,7 +1279,7 @@ def tracking_feet_contact(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[i
     reward &= mask
     return torch.all(reward, dim=1)
 
-def calc_target_feet_contact(env, phase_thresh):
+def calc_target_feet_contact(env, phase_thresh, period: float = 1.0):
     if not hasattr(env, "ref_observation_manager"):
         raise RuntimeError("Reference observation manager is not available, function `tracking_feet_contact` cannot be called.")
     # target_feet_contact, mask = env.ref_observation_manager.get_term("feet_contact")
@@ -1220,10 +1290,10 @@ def calc_target_feet_contact(env, phase_thresh):
         rht_sin_phase, _ = env.ref_observation_manager.get_term("rht_sin_phase")
         rht_cos_phase, _ = env.ref_observation_manager.get_term("rht_cos_phase")
     except:
-        lft_sin_phase = get_phase(env, offset=0.0)
-        lft_cos_phase = get_phase(env, offset=0.25)
-        rht_sin_phase = get_phase(env, offset=0.5)
-        rht_cos_phase = get_phase(env, offset=0.75)
+        lft_sin_phase = get_phase(env, offset=0.0, period=period)
+        lft_cos_phase = get_phase(env, offset=0.25, period=period)
+        rht_sin_phase = get_phase(env, offset=0.5, period=period)
+        rht_cos_phase = get_phase(env, offset=0.75, period=period)
         mask = torch.zeros(lft_sin_phase.shape[0], dtype=torch.bool).to(lft_sin_phase.device)
     
     lft_phi = torch.atan2(lft_sin_phase, lft_cos_phase)
@@ -1239,46 +1309,25 @@ def calc_target_feet_contact(env, phase_thresh):
     mask = mask.clone()
     return target_feet_contact, mask
 
-def tracking_feet_contact_phase(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), contact_time_thresh: float = 0.05, phase_thresh: float = 0.55, penalty_false: float = 0.0, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def tracking_feet_contact_phase(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), contact_time_thresh: float = 0.05, phase_thresh: float = 0.55, penalty_false: float = 0.0, period: float = 0.8, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Reward the agent for tracking the target feet contact."""
     if ref_id is None:
         ref_id = [0, 1]
 
-    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh)
+    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh, period=period)
     
     target_feet_contact = target_feet_contact[:, ref_id]
     # mask = mask.unsqueeze(1)
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     has_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > contact_time_thresh
-    # feet_link_quat = env.scene[asset_cfg.name].data.body_state_w[:, asset_cfg.body_ids, 3:7]
-    # lft_feet_quat = feet_link_quat[:, 0]
-    # rht_feet_quat = feet_link_quat[:, 1]
-    # lft_feet_rot_mat = matrix_from_quat(lft_feet_quat).unsqueeze(1)
-    # rht_feet_rot_mat = matrix_from_quat(rht_feet_quat).unsqueeze(1)
-    # feet_rot_mat = torch.cat([lft_feet_rot_mat, rht_feet_rot_mat], dim=1)
-    # parallel_contact = is_foot_parallel_from_rot_matrix(feet_rot_mat, tolerance_deg=10)
-    # has_contact &= is_parallel
-    # has_contact &= (contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > 5.0 * contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :2].norm(dim=-1))
-    # has_contact = has_contact[:, ref_id]
-    # parallel_contact = parallel_contact[:, ref_id]
-    
     reward = (target_feet_contact == has_contact)
     reward = torch.all(reward, dim=1) # left contact + right contact
-    # reward &= mask
-    # penalty = (target_feet_contact != has_contact)
-    # penalty = torch.any(penalty, dim=1)
-    # parallel_contact = (has_contact & target_feet_contact) & parallel_contact
-    # penalty &= mask
-    # reward = reward.float() - penalty.float() * penalty_false
-    # parallel_reward = torch.sum(parallel_contact, dim=1)
-    # reward = reward.float() + parallel_reward.float() * 2.5
-    # reward *= mask
     return reward
 
-def penalize_feet_contact_not_in_phase(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), contact_time_thresh: float = 0.01, phase_thresh: float = 0.55, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def penalize_feet_contact_not_in_phase(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), contact_time_thresh: float = 0.01, phase_thresh: float = 0.55, period: float = 1.0, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     if ref_id is None:
         ref_id = [0, 1]
-    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh)
+    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh, period=period)
     target_feet_contact = target_feet_contact[:, ref_id]
     mask = mask.unsqueeze(1)
     contact_sensor = env.scene.sensors[sensor_cfg.name]
@@ -1288,23 +1337,26 @@ def penalize_feet_contact_not_in_phase(env, sensor_cfg: SceneEntityCfg = None, r
     # not_in_contact &= mask
     return not_in_contact
 
-def penalize_one_foot_always_contact(env, sensor_cfg: SceneEntityCfg = None, phase_thresh: float = 0.55, contact_time_thresh: float = 0.05, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def penalize_one_foot_always_contact(env, command_name: str, sensor_cfg: SceneEntityCfg = None, phase_thresh: float = 0.55, contact_time_thresh: float = 0.05, period: float = 1.0, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     still_has_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > contact_time_thresh
-    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh)
+    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh, period=period)
     target_feet_not_contact = ~target_feet_contact
     not_in_contact_penalty = target_feet_not_contact & still_has_contact
+    vel_command = env.command_manager.get_command(command_name)
+    speed = torch.norm(vel_command[:, :2], dim=1)
+    speed_mask = speed > 0.1
     # not_in_contact_penalty *= mask
-    return torch.sum(not_in_contact_penalty, dim=1) * mask
+    return torch.sum(not_in_contact_penalty, dim=1) * speed_mask.float()
 
     
 
-def reward_continuous_feet_contact(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), upper_bound: float = 0.5, phase_thresh: float = 0.55, penalty_false: float = 2) -> torch.Tensor:
+def reward_continuous_feet_contact(env, sensor_cfg: SceneEntityCfg = None, ref_id: list[int] = slice(None), upper_bound: float = 0.5, phase_thresh: float = 0.55, period: float = 1.0, penalty_false: float = 2) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
     contact_time = contact_time[:, ref_id].clamp(max=upper_bound)
-    target_feet_contact = calc_target_feet_contact(env, phase_thresh)
-    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh)
+    target_feet_contact = calc_target_feet_contact(env, phase_thresh, period=period)
+    target_feet_contact, mask = calc_target_feet_contact(env, phase_thresh, period=period)
     target_feet_contact = target_feet_contact[:, ref_id]
     true_contact = torch.where((target_feet_contact | (~mask).unsqueeze(1)), contact_time, torch.zeros_like(contact_time))
     true_contact = true_contact.clamp(max=upper_bound)
@@ -1314,18 +1366,35 @@ def reward_continuous_feet_contact(env, sensor_cfg: SceneEntityCfg = None, ref_i
     return torch.sum(res, dim=1)
 
 def compute_actual_body_pose_robot_frame(env, asset_cfg: SceneEntityCfg):
-    # Compute the actual link poses in the robot base frame
+    # Compute the actual link poses in the robot base frame  
     actual_link_w = env.scene[asset_cfg.name].data.body_state_w[:, asset_cfg.body_ids, :7]
     actual_root_w = env.scene[asset_cfg.name].data.root_state_w[:, :7]
-    actual_root_w = actual_root_w.unsqueeze(1).repeat(1, len(asset_cfg.body_ids), 1)
+    num_links = actual_link_w.shape[1]
+    actual_root_w = actual_root_w.unsqueeze(1).repeat(1, num_links, 1)
     actual_link_w = actual_link_w.reshape(-1, 7)
     actual_root_w = actual_root_w.reshape(-1, 7)
     actual = torch.cat(subtract_frame_transforms(
         actual_root_w[:, :3], actual_root_w[:, 3:7],
         actual_link_w[:, :3], actual_link_w[:, 3:7],
     ), dim=-1)
-    actual = actual.reshape(-1, len(asset_cfg.body_ids), 7)
+    actual = actual.reshape(-1, num_links, 7)
     return actual
+
+def recover_body_pos_robot_frame_to_global(r_pos, r_quat, local_poses, local_quats):
+
+
+    r_pos = r_pos.unsqueeze(1).repeat(1, local_poses.shape[1], 1)
+    
+    r_quat = r_quat.unsqueeze(1).repeat(1, local_quats.shape[1], 1)
+    local_poses = local_poses.reshape(-1, 3)
+    local_quats = local_quats.reshape(-1, 4)
+    r_pos = r_pos.reshape(-1, 3)
+    r_quat = r_quat.reshape(-1, 4)
+    global_poses, global_quats = combine_frame_transforms(
+        r_pos, r_quat,
+        local_poses, local_quats,
+    )
+    return global_poses, global_quats
 
 def tracking_body_pos_robot_frame(env, std: float, xyz_dim: tuple = (0, 1, 2), asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
     target, mask = env.ref_observation_manager.get_term("target_link_poses")
@@ -1670,8 +1739,8 @@ def no_jump(env, command_name:str, sensor_cfg: SceneEntityCfg, asset_cfg: SceneE
     """
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     contacts = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1)
-    double_contact = contacts.sum(dim=1) == 2
-    return double_contact.float() * (torch.norm(env.command_manager.get_command(command_name)[:,:2], dim=1) < 0.1).float()
+    double_contact = contacts.sum(dim=1) == 0
+    return double_contact.float() * (torch.norm(env.command_manager.get_command(command_name)[:,:2], dim=1) > 0.1).float()
 
 def jumping_penalty(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize jumping
@@ -1977,9 +2046,17 @@ def reward_orientation_non_violation(env, asset_cfg: SceneEntityCfg = SceneEntit
     """Penalize the agent for exceeding the orientation limit."""
     asset = env.scene[asset_cfg.name]
     projected_gravity = asset.data.projected_gravity_b[:, :2]
-    orientation_violation = torch.exp(-torch.sum(torch.square(projected_gravity)) / 0.1**2)
+    orientation_violation = torch.exp(-torch.sum(torch.square(projected_gravity)) / 0.2**2)
     return orientation_violation
 
+def not_standing_still(env, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Reward the agent for not standing still when velocity command is given."""
+    command = env.command_manager.get_command(command_name)
+    speed_cmd = torch.norm(command[:, :2], dim=1)
+    base_lin_vel = env.scene[asset_cfg.name].data.root_lin_vel_b[:, :2]
+    speed_actual = torch.norm(base_lin_vel, dim=1)
+    speed_reward = torch.where(speed_cmd > 0.1, speed_actual, torch.zeros_like(speed_actual))
+    return speed_reward
 
 def reward_base_height(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Reward the agent for keeping the base height within a certain range."""
@@ -1987,5 +2064,16 @@ def reward_base_height(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"))
     base_height = asset.cfg.init_state.pos[2] # base height
     current_base_height = asset.data.root_state_w[:, 2]
     height_diff = base_height - current_base_height
+    height_diff = torch.where(height_diff > 0, height_diff, torch.zeros_like(height_diff)) # only consider the case when the base is lower than the initial height
     height_error = torch.exp(-torch.square(height_diff) / 0.1**2)
     return height_error
+
+def feet_swing_height(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Feet swing height reward according to unitree_g1 official implementation."""
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    feet_height = env.scene[asset_cfg.name].data.body_state_w[:, sensor_cfg.body_ids, 2]
+    in_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    pos_err = feet_height - 0.08
+    sqr_err = pos_err ** 2
+    sqr_err = sqr_err * (~in_contact).float()
+    return sqr_err.sum(dim=1) # shape: (num_envs,)

@@ -5,13 +5,54 @@ from GBC.gyms.isaaclab_45.managers import RefObservationManager, ReferenceComman
 
 from .manager_based_ref_rl_env_cfg import ManagerBasedRefRLEnvCfg
 import torch
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg, DEFORMABLE_TARGET_MARKER_CFG, CONTACT_SENSOR_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG, FRAME_MARKER_CFG
+from isaaclab.managers import SceneEntityCfg
+from GBC_MUJICA.diffusion_planner.data_loaders.humanoid_utils import HML_LINK_NAMES, HML_EE_LINK_NAMES, HML_ROOT_LINK_NAME
+import isaaclab.sim as sim_utils
+import GBC.gyms.isaaclab_45.lab_tasks.mdp as gbc_mdp
 
+class DebugVisualizer:
+    def __init__(self, env):
+        self.env = env        
+        self._init_markers()
+        
+    def _init_markers(self):
+        links = HML_LINK_NAMES  # exclude root link
+        # base link markers
+        marker_base_cfg = GREEN_ARROW_X_MARKER_CFG.replace(prim_path="/World/base_link_marker")
+        self.base_link_marker = VisualizationMarkers(marker_base_cfg)
+        
+        marker_link_cfg = VisualizationMarkersCfg(
+            prim_path="/World/link_markers",
+            markers={
+                f'marker_{link}': 
+                    sim_utils.SphereCfg(
+                        radius=0.05,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.467, 0.6, 0.8)), # #7799CC for Togawa Sakiko
+                    )
+                for link in links
+                }
+        )
+        self.link_markers = VisualizationMarkers(marker_link_cfg)
+            
+    def step(self, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+        pose, mask = self.env.ref_observation_manager.get_term("target_base_pose")
+        pose = pose[mask]
+        r_pos, r_quat = pose[:, :3], pose[:, 3:7]
+        self.base_link_marker.visualize(r_pos, r_quat)
+        target_link_poses, mask = self.env.ref_observation_manager.get_term("target_link_poses")
+        target_link_poses = target_link_poses[mask]
+        global_link_pos, global_link_quat = gbc_mdp.recover_body_pos_robot_frame_to_global(r_pos, r_quat, target_link_poses[..., :3], target_link_poses[..., 3:7])
+        self.link_markers.visualize(global_link_pos, global_link_quat)
+        
+        
 class ManagerBasedRefRLEnv(ManagerBasedRLEnv):
     cfg: ManagerBasedRefRLEnvCfg
 
     def __init__(self, cfg: ManagerBasedRefRLEnvCfg, **kwargs):
         super().__init__(cfg=cfg, **kwargs)
         self.cur_time = torch.zeros(self.num_envs, device=self.device)
+        # self.debug_vis = DebugVisualizer(self)
 
     def load_managers(self):
         self.ref_observation_manager = RefObservationManager(self.cfg.ref_observation, self)
@@ -108,6 +149,8 @@ class ManagerBasedRefRLEnv(ManagerBasedRLEnv):
         # always call physics_modifier_manager.update **AFTER** computing observations
         if self.physics_modifier_manager is not None:
             self.physics_modifier_manager.update()
+            
+        # self.debug_vis.step()
         # if self.use_custom_obs:
         #     self.custom_obs_buf = self.observation_manager.custom_compute()
 

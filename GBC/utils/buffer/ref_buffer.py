@@ -92,15 +92,147 @@ class BufferManager:
     def set_all_env_ref_id(self, env_ref_id: torch.Tensor):
         self.env_ref_id = env_ref_id.to(torch.int32)
 
-    def reset(self, env, env_ids: Sequence[int] | None = None):
+    def remove_motions(self, motion_ids_to_remove: Sequence[int]) -> dict:
+        """
+        Remove specified motions from the buffer manager.
+
+        This is an expensive operation that requires rebuilding all buffers.
+        It also remaps env_ref_id for environments using motions after the removed ones.
+
+        Args:
+            motion_ids_to_remove: List of motion indices to remove (0-indexed)
+
+        Returns:
+            dict with:
+                - 'removed_count': Number of motions actually removed
+                - 'new_num_ref': New total number of motions
+                - 'id_mapping': Dict mapping old motion IDs to new motion IDs (for valid motions)
+                - 'affected_envs': Tensor of env IDs that were using removed motions
+        """
+        if not motion_ids_to_remove:
+            return {'removed_count': 0, 'new_num_ref': self.num_ref, 'id_mapping': {i: i for i in range(self.num_ref)}, 'affected_envs': torch.tensor([], device=self.device)}
+
+        # Convert to set and validate
+        to_remove = set(motion_ids_to_remove)
+        to_remove = {i for i in to_remove if 0 <= i < self.num_ref}
+
+        if not to_remove:
+            return {'removed_count': 0, 'new_num_ref': self.num_ref, 'id_mapping': {i: i for i in range(self.num_ref)}, 'affected_envs': torch.tensor([], device=self.device)}
+
+        # Build mapping from old IDs to new IDs
+        # Motions to keep (in original order)
+        keep_ids = [i for i in range(self.num_ref) if i not in to_remove]
+        id_mapping = {old_id: new_id for new_id, old_id in enumerate(keep_ids)}
+
+        new_num_ref = len(keep_ids)
+
+        # Find environments affected (using removed motions)
+        affected_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for rid in to_remove:
+            affected_mask |= (self.env_ref_id == rid)
+        affected_envs = torch.where(affected_mask)[0]
+
+        # Update env_ref_id: remap valid IDs, mark affected envs for reassignment
+        new_env_ref_id = torch.zeros_like(self.env_ref_id)
+        for old_id, new_id in id_mapping.items():
+            mask = (self.env_ref_id == old_id)
+            new_env_ref_id[mask] = new_id
+
+        # Affected envs get random new assignment
+        if len(affected_envs) > 0 and new_num_ref > 0:
+            new_env_ref_id[affected_envs] = torch.randint(
+                0, new_num_ref,
+                (len(affected_envs),),
+                dtype=self.env_ref_id.dtype,
+                device=self.device
+            )
+
+        self.env_ref_id = new_env_ref_id
+
+        # Rebuild per-motion tensors
+        self.buffer_type = self.buffer_type[keep_ids].contiguous()
+        self.frame_rate = self.frame_rate[keep_ids].contiguous()
+        self.max_len = self.max_len[keep_ids].contiguous()
+        self.recurrent_subseq = self.recurrent_subseq[keep_ids].contiguous()
+        self.env_origin_z = self.env_origin_z[keep_ids].contiguous()
+
+        # Rebuild ref_buffer_list and ref_buffer for each key
+        for key in list(self.ref_buffer_list.keys()):
+            old_list = self.ref_buffer_list[key]
+
+            if self.is_constant.get(key, False):
+                # For constant buffers, just reindex
+                new_list = [old_list[i] for i in keep_ids]
+                self.ref_buffer_list[key] = new_list
+                self.ref_buffer[key] = torch.stack(new_list)
+            else:
+                # For non-constant buffers, need to rebuild concatenated buffer
+                # Note: ref_buffer_list has a zero-padding at front after prepare_buffers()
+                # The structure is: [zero_pad] + [motion_0_data] + [motion_1_data] + ...
+                # We need to extract the original data and rebuild
+
+                # Calculate old lengths (from max_len before we modified it)
+                # Actually, we already modified max_len, but the data is in ref_buffer
+                # We need to rebuild from ref_buffer using old start_index
+
+                if self.start_index is not None:
+                    # Extract individual motion data from concatenated buffer
+                    old_buffer = self.ref_buffer[key]
+                    old_start_index = self.start_index.clone()
+                    old_max_len_orig = self.max_len.clone()  # This is already the kept version
+
+                    # We need original max_len before removal - reconstruct from start_index differences
+                    # Actually, we can get lengths from the structure:
+                    # start_index[i+1] - start_index[i] - 1 = max_len[i] (the -1 is for the padding)
+                    # But we already updated max_len...
+
+                    # Let's rebuild from the current ref_buffer which still has old structure
+                    new_list = []
+                    # The ref_buffer_list should still have the old structure
+                    # ref_buffer_list[key] = [zero_pad, motion_0, motion_1, ...]
+                    # After prepare_buffers, the first element is zero_pad
+                    if len(old_list) > 0:
+                        # Skip the zero_pad (first element) and get motion data
+                        # keep_ids are 0-indexed motion IDs, so we need keep_ids+1 for list indexing
+                        new_list = [old_list[0]]  # Keep zero pad
+                        for old_id in keep_ids:
+                            new_list.append(old_list[old_id + 1])  # +1 to skip zero pad
+                        self.ref_buffer_list[key] = new_list
+                        # Rebuild concatenated buffer
+                        self.ref_buffer[key] = torch.concatenate(new_list, dim=0).contiguous()
+
+        # Update num_ref
+        self.num_ref = new_num_ref
+
+        # Rebuild start_index
+        if self.start_index is not None:
+            len_sum = torch.cumsum(self.max_len, dim=0)
+            self.start_index = torch.zeros(self.num_ref, dtype=torch.int32, device=self.device)
+            if self.num_ref > 1:
+                self.start_index[1:] = len_sum[:-1]
+            self.start_index += 1  # Account for zero padding at front
+
+        # Clear cached values
+        self.last_time = None
+        self.last_idx = None
+
+        return {
+            'removed_count': len(to_remove),
+            'new_num_ref': new_num_ref,
+            'id_mapping': id_mapping,
+            'affected_envs': affected_envs
+        }
+
+    def reset(self, env, env_ids: Sequence[int] | None = None, skip_motion_randomization: bool = False):
         if env_ids is None:
             env_ids = slice(None)
-        self.env_ref_id[env_ids] = torch.randint(
-            0, self.num_ref,
-            size=self.env_ref_id[env_ids].shape,
-            dtype=self.env_ref_id.dtype,
-            device=self.env_ref_id.device,
-        )
+        if not skip_motion_randomization:
+            self.env_ref_id[env_ids] = torch.randint(
+                0, self.num_ref,
+                size=self.env_ref_id[env_ids].shape,
+                dtype=self.env_ref_id.dtype,
+                device=self.env_ref_id.device,
+            )
         self.last_pose_tme[env_ids] = -1
         root_pose_w = env.scene["robot"].data.root_state_w[env_ids, :7]
         root_pose_w = root_pose_w.clone()
@@ -249,6 +381,34 @@ class BufferManager:
             return self.calculate_quat_obs(key, current_time)
         current_idx = self.calc_idx(current_time)
         return self.ref_buffer[key][current_idx, ...]
+    
+    def calc_obs_multi_step(self, key, current_time: torch.Tensor, num_steps: int):
+        '''
+        This function returns a tensor of shape (num_envs, num_steps, *obs_dim). Currently supporting only non cumulative and non quat obs.
+        '''
+        assert not self.is_constant[key], "Cumulative observation not supported for constant buffer."
+        assert 'target_quaternion' not in key, "Multi step quaternion observation not supported."
+        current_num_cyclic_subseq, current_idx, current_begin_idx, current_end_idx = self.calc_num_cyclic_subseq(current_time)
+        # 2 cases:
+        # 1. current_idx + num_steps < end_idx: simply slice
+        # 2. current_idx < end_idx < current_idx + num_steps
+        #  slice [current_idx, end_idx) + (num_cycles - 1) * slice[begin_idx, end_idx) + slice[begin_idx, remaining)]
+        obs_dim = self.get_dim(key)
+        multi_step_obs = torch.zeros((self.num_envs, num_steps, *obs_dim), dtype=self.ref_buffer[key].dtype, device=self.device)
+        slice_raw = torch.arange(num_steps, device=self.device).unsqueeze(0).repeat(self.num_envs, 1) + current_idx.unsqueeze(1) # (num_envs, num_steps)
+        # idx mapping: each idx in slice_raw will be mapped using (idx - begin_idx) % (end_idx - begin_idx) + begin_idx. No for loop.
+        begin_idx_exp = current_begin_idx.unsqueeze(1)
+        end_idx_exp = current_end_idx.unsqueeze(1)
+        rec_len_exp = (end_idx_exp - begin_idx_exp)
+        slice_mapped = torch.where(
+            slice_raw >= begin_idx_exp,
+            begin_idx_exp + (slice_raw - begin_idx_exp) % rec_len_exp,
+            slice_raw
+        )
+        multi_step_obs = self.ref_buffer[key][slice_mapped, ...]  # (num_envs, num_steps, *obs_dim)
+        return multi_step_obs
+
+        
     
     def calc_cumulative_obs(self, key, current_time: torch.Tensor):
         if self.is_constant[key]:
@@ -565,8 +725,10 @@ class BufferManager:
         lin_vel_yaw_frame = self.calc_obs(lin_vel_name, current_time)
         ang_vel = self.calc_obs(ang_vel_name, current_time)
         try:
-            self.base_pos, self.base_quat = self.calc_base_pose_from_trans_quat(current_time)
-            return torch.cat([self.base_pos, self.base_quat], dim=1)
+            # Use calc_base_pose_from_trans_quat if trans and target_quaternion are available
+            # DO NOT assign to self.base_pos and self.base_quat as they are for integration state
+            base_pos, base_quat = self.calc_base_pose_from_trans_quat(current_time)
+            return torch.cat([base_pos, base_quat], dim=1)
         except:
             try:
                 self.step_robot_base_pose(current_time, lin_vel_yaw_frame, ang_vel)
@@ -602,7 +764,8 @@ class BufferManager:
         current_num_cyclic_subseq: wp.array(dtype=wp.int32),
         
         cyclic_quat_diff: wp.array(dtype=wp.quat),
-        cyclic_lin_xyz_diff_local: wp.array(dtype=wp.vec3)
+        cyclic_lin_xyz_diff_local: wp.array(dtype=wp.vec3),
+        begin_quat_yaw: wp.array(dtype=wp.quat)  # Add yaw-only quaternion parameter
     ):
         tid = wp.tid()
 
@@ -615,7 +778,8 @@ class BufferManager:
         else:
             
             accumulated_pos = trans_buffer[b_idx]
-            accumulated_quat = quat_buffer[b_idx]
+            # Use yaw-only quaternion for accumulation to avoid Z drift from pitch/roll
+            accumulated_quat = begin_quat_yaw[tid]
 
             i = wp.int32(0)
             while i < num_cycles:
@@ -651,13 +815,18 @@ class BufferManager:
         
         q_begin = self.ref_buffer['target_quaternion'][begin_indices]
         q_end = self.ref_buffer['target_quaternion'][end_indices]
-        cyclic_quat_diff = quat_mul(q_end, quat_inv(q_begin))
+        # Only keep yaw component (rotation around z-axis)
+        q_begin_yaw = yaw_quat(q_begin)
+        q_end_yaw = yaw_quat(q_end)
+        cyclic_quat_diff = quat_mul(q_end_yaw, quat_inv(q_begin_yaw))
         
         #    p_delta = p_end - p_begin
         p_begin = self.ref_buffer['trans'][begin_indices]
         p_end = self.ref_buffer['trans'][end_indices]
         cyclic_lin_xyz_diff = p_end - p_begin
-        cyclic_lin_xyz_diff_local = quat_apply(quat_inv(q_begin), cyclic_lin_xyz_diff)
+        cyclic_lin_xyz_diff[...,2] = 0.0  # only keep x,y components
+        # Use yaw-only quaternion to transform position delta to local frame
+        cyclic_lin_xyz_diff_local = quat_apply(quat_inv(q_begin_yaw), cyclic_lin_xyz_diff)
         final_pos_out = wp.zeros(self.num_envs, dtype=wp.vec3, device=self.device)
         final_quat_out = wp.zeros(self.num_envs, dtype=wp.quat, device=self.device)
         
@@ -676,7 +845,8 @@ class BufferManager:
                 wp.from_torch((begin_indices).to(torch.int32)),
                 wp.from_torch((current_num_cyclic_subseq).to(torch.int32)),
                 wp.from_torch(to_xyzw(cyclic_quat_diff), dtype=wp.quat),
-                wp.from_torch(cyclic_lin_xyz_diff_local, dtype=wp.vec3)
+                wp.from_torch(cyclic_lin_xyz_diff_local, dtype=wp.vec3),
+                wp.from_torch(to_xyzw(q_begin_yaw), dtype=wp.quat)  # Pass yaw-only quaternion
                 
             ],
         device=self.device
@@ -777,7 +947,10 @@ class BufferManager:
         # Calculate quaternion difference over one complete cycle
         q_begin = self.ref_buffer[key][begin_indices]  # shape: (num_envs, 4)
         q_end = self.ref_buffer[key][end_indices]      # shape: (num_envs, 4)
-        cyclic_quat_diff = quat_mul(q_end, quat_inv(q_begin))  # Quaternion representing one cycle rotation
+        # Only keep yaw component (rotation around z-axis)
+        q_begin_yaw = yaw_quat(q_begin)
+        q_end_yaw = yaw_quat(q_end)
+        cyclic_quat_diff = quat_mul(q_end_yaw, quat_inv(q_begin_yaw))  # Quaternion representing one cycle rotation
         
         # Prepare output tensor and convert quaternion buffer to warp format
         final_quat_out = wp.zeros(self.num_envs, dtype=wp.quat, device=self.device)

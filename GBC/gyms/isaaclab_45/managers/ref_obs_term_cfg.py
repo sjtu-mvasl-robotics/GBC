@@ -26,6 +26,10 @@ class ReferenceObservationTermCfg(ManagerTermBaseCfg):
     noise: NoiseCfg | None = None
     clip: tuple[float, float] | None = None
     
+    steps: int = 1 # Hint: this functions quite like history, but is only valid for recurrent mode, which samples multiple steps (from the sample time point and on) in one go.
+    sample_rate: int = 1
+    """The sample rate for the reference observation term."""
+    
     scale: float | None = None
     
     make_empty: bool = False

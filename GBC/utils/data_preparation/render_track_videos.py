@@ -353,3 +353,57 @@ class PoseRenderer:
             fps = data['fps']
             name = data['title'][0]
             self.render_pose(pose, os.path.join(self.save_path, name), fps, name)
+
+
+if __name__ == "__main__":
+    mapping_table = {
+        'Pelvis': 'base_link',
+        'L_Hip': 'Link_hip_l_yaw',
+        'R_Hip': 'Link_hip_r_yaw',
+        'L_Knee': 'Link_knee_l_pitch',
+        'R_Knee': 'Link_knee_r_pitch',
+        'L_Ankle': 'Link_ankle_l_pitch',
+        'R_Ankle': 'Link_ankle_r_pitch',
+        'L_Toe': 'Link_ankle_l_roll',
+        'R_Toe': 'Link_ankle_r_roll',
+        'L_Shoulder': 'Link_arm_l_01',
+        'R_Shoulder': 'Link_arm_r_01',
+        'L_Elbow': 'Link_arm_l_04',
+        'R_Elbow': 'Link_arm_r_04',
+        'L_Wrist': 'Link_arm_l_06',
+        'R_Wrist': 'Link_arm_r_06',
+        'Head': 'Link_head_yaw'
+        }
+    
+    
+                    
+    smplh_model_path="/home/rl/sjtu/data/smplh/male/model.npz"
+    # smplh_model_path="../../../data/smplh/male/model.npz"
+    dmpls_model_path="/home/rl/sjtu/data/dmpls/male/model.npz"
+    # dmpls_model_path="../../../data/dmpls/male/model.npz"
+    urdf_path="/home/rl/unitree_ros/robots/h1_2_description/h1_2.urdf"
+    # urdf_path="../../../data/turing_model/full_dof/urdf/full_dof_al_v2.urdf"
+    dataset_path='/home/rl/sjtu/data/amass'
+    # dataset_path='../../../data/amass'
+    smpl_fits_dir="/home/rl/sjtu/GBC/best_fit.pt"
+    # smpl_fits_dir = '../../best_fit.pt'
+    # device = 'cpu'
+    device = 'cuda'
+
+    poseformer_model_path = "fit_h1_2/models/30_10_49_epoch_270.pt"
+    # poseformer_model_path = "./models/15_17_56_epoch_20.pt"
+    save_path = "/home/rl/sjtu/RobotCodespace/GBC/rendered_videos"
+    # save_path = "rendered_videos"
+
+    renderer = PoseRenderer(
+        urdf_path=urdf_path,
+        dataset_path=dataset_path,
+        mapping_table=mapping_table,
+        smplh_model_path=smplh_model_path,
+        dmpls_model_path=dmpls_model_path,
+        poseformer_model_path=poseformer_model_path,
+        save_path=save_path,
+        device=device,
+        secondary_dir="ACCAD/Female1Walking_c3d"
+    )
+    renderer.main()

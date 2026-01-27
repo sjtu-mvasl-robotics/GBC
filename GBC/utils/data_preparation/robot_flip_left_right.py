@@ -233,3 +233,92 @@ class TurinV3FlipLeftRight(RobotFlipLeftRight):
                 self.flip_rpy_dict[name][side_id][1].append(i)
 
         self.is_prepared = True
+
+class UnitreeG1FlipLeftRight(RobotFlipLeftRight):
+    def __init__(self, cfg=None):
+        super().__init__(cfg)
+
+    def prepare_flip_joint_ids(self, dof_names: list[str] | None = None):
+        if dof_names is None:
+            self.fk = RobotKinematics(self.urdf_path)
+            self.dof_names = self.fk.dof_names
+        else:
+            self.dof_names = dof_names
+
+        self.num_dofs = len(self.dof_names)
+
+        self.flip_sign_ids = [
+            # self.dof_names.index(name) for name in ("torso_joint",)
+        ]
+        self.flip_sign_ids = torch.tensor(self.flip_sign_ids, device=self.device)
+
+        self.swap_dict = {}
+        self.flip_rpy_dict = {}
+        for i in reversed(range(len(self.dof_names))):
+            joint_name = self.dof_names[i]
+            if "left" in joint_name or "right" in joint_name:
+                names = joint_name.split("_")
+                name = names[1]
+                if len(names) == 3:
+                    # No roll, pitch, yaw, simply swap left and right
+                    if name not in self.swap_dict:
+                        self.swap_dict[name] = []
+                    self.swap_dict[name].append(i)
+                else:
+                    if name not in self.flip_rpy_dict:
+                        self.flip_rpy_dict[name] = [["", []] for _ in range(2)]
+                    side_id = ["left", "right"].index(names[0])
+                    angle_id = names[2][0]
+                    self.flip_rpy_dict[name][side_id][0] += self.AXIS_ID[self.ANGLE_ID.index(angle_id)]
+                    self.flip_rpy_dict[name][side_id][1].append(i)
+
+        self.is_prepared = True
+                    
+if __name__ == "__main__":
+    from GBC.utils.data_preparation.data_preparation_cfg import AMASSActionConverterCfg
+    from GBC.utils.data_preparation.robot_visualizer import RobotVisualizer
+    from GBC.utils.base.assets import DATA_PATHS
+    from PIL import Image
+
+    root_path = os.path.join(os.path.dirname(__file__), *([".."] * 3))
+    urdf_path = DATA_PATHS.urdf_path
+    pkl_path = os.path.join(root_path, "output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B1 - stand to walk_poses.pkl")
+    action_id = 0
+
+    device = "cuda:0"
+    data = torch.load(pkl_path, map_location=device)
+    actions = data["actions"]
+
+    cfg = AMASSActionConverterCfg(
+        urdf_path = DATA_PATHS.urdf_path,
+        pose_transformer_path=DATA_PATHS.pose_transformer_path, 
+        export_path=DATA_PATHS.converted_actions_path)
+
+    # vis_robot = RobotVisualizer(urdf_path, device=device)
+    # img_orig = vis_robot(actions[action_id])
+
+    flip_robot = UnitreeH12FlipLeftRight(cfg)
+
+    # img_new = vis_robot(flip_robot(actions[action_id]))
+
+    # img = np.concatenate([img_orig, img_new], axis=1)
+    # Image.fromarray(img).save("test_flip_robot.png")
+
+    X = torch.rand(100000, actions.shape[1], device=actions.device, dtype=actions.dtype) * 2 - 1
+    Y = flip_robot(X)
+    X_np = X.cpu().numpy()
+    Y_np = Y.cpu().numpy()
+    from sklearn.linear_model import LinearRegression
+    model_sklearn = LinearRegression()
+    model_sklearn.fit(X_np, Y_np)
+    print("\n--- Scikit-learn LinearRegression Results ---")
+    print("Predicted Weights (D_in x D_out):\n", model_sklearn.coef_.T) # scikit-learn stores coef_ as (D_out, D_in) for multi-output
+    coefs = model_sklearn.coef_
+    valid_coef = np.int32(np.abs(coefs) > 1e-5)
+    print(np.sum(valid_coef, axis=1))
+    print(coefs[np.where(valid_coef > 0)])
+    dof_names = flip_robot.dof_names
+    for i, name1 in enumerate(dof_names):
+        j = np.where(valid_coef[i])[0][0]
+        name2 = dof_names[j]
+        print(name1, name2, coefs[i, j])

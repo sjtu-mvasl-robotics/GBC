@@ -2,7 +2,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 class StdUpdater:
-    def __init__(self, std_list, reward_key, reward_threshold=0.8, reward_hist=128, step_threshold_down=32*1200, step_threshold_up=32*200):
+    def __init__(self, std_list, reward_key, reward_threshold=0.8, reward_hist=128, step_threshold_down=24*1200, step_threshold_up=24*50):
         self.std_list = std_list
         self.reward_key = reward_key
         self.level = 0

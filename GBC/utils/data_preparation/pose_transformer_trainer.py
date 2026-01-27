@@ -11,7 +11,7 @@ import numpy as np
 from GBC.utils.base.math_utils import swap_order, symmetry_smplh_pose, batch_angle_axis_to_ypr
 from GBC.utils.data_preparation.data_preparation_cfg import BaseCfg
 from GBC.utils.data_preparation.render_track_videos import PoseRenderer
-from GBC.utils.data_preparation.pose_transformer import PoseTransformer, PoseTransformerV2
+from GBC.utils.data_preparation.pose_transformer import PoseTransformer, PoseTransformerV2, PoseTransformerDecoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +41,9 @@ class LossCoefficients:
     symmetry_loss: float = 1000.0
     reference_action_loss: float = 5000.0
     bone_direction_loss: float = 1000.0
+    
+    # Reconstruction loss
+    reconstruction_loss: float = 1000.0
     
     # Progressive disturbance loss (will be multiplied by progressive coefficient)
     disturbance_base: float = 1.0
@@ -232,6 +235,7 @@ class PoseFormerTrainer:
                  loss_coefficients: Optional[LossCoefficients] = None,
                  use_wandb: bool = True,
                  wandb_project: str = "pose_transformer_training",
+                 train_decoder: bool = False
                 ):
         assert 0 < train_size < 1, 'Train size must be between 0 and 1'
         self.use_reference_actions = use_reference_actions
@@ -262,6 +266,10 @@ class PoseFormerTrainer:
         # self.model = SpatialMoETransformer(load_hands=load_hands, robot_actions=self.num_dofs).to(device)
         self.model = PoseTransformer(load_hands=load_hands, num_actions=self.num_dofs).to(device)
         self.flip_left_right = None
+        if train_decoder:
+            self.decoder = PoseTransformerDecoder(load_hands=load_hands, num_actions=self.num_dofs).to(device)
+        else:
+            self.decoder = None
         # self.model = PoseMLP(load_hands=load_hands,num_actions=self.num_dofs).to(device)
 
         # Check if model supports auxiliary loss
@@ -432,33 +440,48 @@ class PoseFormerTrainer:
         return loss
 
 
-    def save(self, path: str, optimizer: torch.optim.Optimizer):
+    def save(self, path: str, optimizer: torch.optim.Optimizer, decoder_optimizer: Optional[torch.optim.Optimizer] = None):
         '''
         Save the model
 
         Args:
             path (str): Path to save the model
-            optimizer (torch.optim.Optimizer): Optimizer
+            optimizer (torch.optim.Optimizer): Optimizer for encoder
+            decoder_optimizer (Optional[torch.optim.Optimizer]): Optimizer for decoder
         '''
-        torch.save({
+        save_dict = {
             'model': self.model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'epoch': self.last_epoch
-        }, path)
+        }
+        
+        if self.decoder is not None:
+            save_dict['decoder'] = self.decoder.state_dict()
+            if decoder_optimizer is not None:
+                save_dict['decoder_optimizer'] = decoder_optimizer.state_dict()
+        
+        torch.save(save_dict, path)
 
-    def load(self, path: str, optimizer: torch.optim.Optimizer):
+    def load(self, path: str, optimizer: Optional[torch.optim.Optimizer] = None, decoder_optimizer: Optional[torch.optim.Optimizer] = None):
         '''
         Load the model
 
         Args:
             path (str): Path to load the model
-            optimizer (torch.optim.Optimizer): Optimizer
+            optimizer (torch.optim.Optimizer): Optimizer for encoder
+            decoder_optimizer (Optional[torch.optim.Optimizer]): Optimizer for decoder
         '''
         checkpoint = torch.load(path)
         self.model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint['optimizer'])
         self.last_epoch = checkpoint['epoch']
         self.last_checkpoint = path
+        
+        if self.decoder is not None and 'decoder' in checkpoint:
+            self.decoder.load_state_dict(checkpoint['decoder'])
+            if decoder_optimizer is not None and 'decoder_optimizer' in checkpoint:
+                decoder_optimizer.load_state_dict(checkpoint['decoder_optimizer'])
 
     def create_model_input(self, pose_body: torch.Tensor, pose_hand: torch.Tensor = None, trans: torch.Tensor = None, override_root_orient: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         '''
@@ -831,6 +854,8 @@ class PoseFormerTrainer:
             total_epochs=epochs, 
             min_lr=min_lr
         )
+        
+            
 
         if load:
             self.load(load_path, optimizer)
@@ -864,6 +889,7 @@ class PoseFormerTrainer:
             total_position_error = 0.0  # Add position error tracking
             total_max_position_error = 0.0  # Add max position error tracking
             total_grad_norm = 0.0  # Add gradient norm tracking
+            total_decoder_reconstruction_loss = 0.0 # decoder reconstruction loss
             
             for i, data in enumerate(tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{epochs} - Training')):
                 if self.use_reference_actions:
@@ -888,13 +914,18 @@ class PoseFormerTrainer:
                 output = output - output[:, 0:1, :]
 
                 gt = self.body_model(**body_parms).Jtr # shape: (N, num_total_joints, 3)
+                
                 # remove gradient from gt
                 gt = gt.detach()
+                gt_full = gt.clone()
                 # reshape gt to match output
                 reshape_idx = [self.smplh_body_names.index(name) for name in self.mapping_table.keys()]
                 if self.load_hands:
                     reshape_idx += [self.smplh_extend_names.index(name) + len(self.smplh_body_names) for name in self.mapping_table.keys()]
-            
+                    
+                
+                    
+
                 gt = gt[:, reshape_idx, :]
                 gt = gt - gt[:, 0:1, :]
                 scale = self.fit_data.get('scale', 1.0)
@@ -1289,3 +1320,557 @@ class PoseFormerTrainer:
                     os.system(f'rm {robot_save_dir} {amass_save_dir} {amass_bm_save_dir}')
                 
             return val_metrics
+
+    def train_decoder(self,
+                    model_path: str,
+                     epochs: int = 100,
+                     lr: float = 1.0e-3,
+                     min_lr: float = 1.0e-5,
+                     warmup_epochs: int = 5,
+                     validation_interval: int = 1,
+                     save_interval: int = 100,
+                     load: bool = False,
+                     load_path: str = '',
+                     freeze_encoder: bool = True,
+                     use_fk_consistency: bool = True,
+                     use_angle_axis_loss: bool = True,
+                     fk_loss_weight: float = 1000.0,
+                     angle_axis_loss_weight: float = 30.0,
+                     visualize: bool = False,
+                     save_figs: bool = False,
+                     **kwargs):
+        '''
+        Train the decoder (inverse model) to reconstruct angle-axis from actions
+        
+        Training strategies:
+        1. Freeze encoder (recommended): Train decoder with fixed encoder
+        2. Joint training: Fine-tune both encoder and decoder together
+        
+        Loss functions:
+        - FK consistency loss: ||FK(encoder(decoder(actions))) - FK(actions)||
+        - Angle-axis reconstruction loss: ||decoder(encoder(angle_axis)) - angle_axis||
+        
+        Args:
+            model_path: Path to the pre-trained encoder model **MUST** be provided
+            epochs: Number of training epochs
+            lr: Learning rate for decoder (and encoder if not frozen)
+            min_lr: Minimum learning rate
+            warmup_epochs: Number of warmup epochs
+            validation_interval: Validation interval
+            save_interval: Save interval
+            load: Load checkpoint or not
+            load_path: Path to load checkpoint
+            freeze_encoder: Whether to freeze encoder during training
+            use_fk_consistency: Use FK consistency loss
+            use_angle_axis_loss: Use direct angle-axis reconstruction loss
+            fk_loss_weight: Weight for FK consistency loss
+            angle_axis_loss_weight: Weight for angle-axis reconstruction loss
+            visualize: Visualize results
+            save_figs: Save visualization figures
+        '''
+        assert self.decoder is not None, "Decoder not initialized. Set train_decoder=True in PoseFormerTrainer.__init__"
+        
+        print("=" * 80)
+        print("DECODER TRAINING")
+        print("=" * 80)
+        print(f"Strategy: {'Freeze Encoder (Recommended)' if freeze_encoder else 'Joint Training (Advanced)'}")
+        print(f"FK Consistency Loss: {use_fk_consistency} (weight: {fk_loss_weight})")
+        print(f"Angle-Axis Loss: {use_angle_axis_loss} (weight: {angle_axis_loss_weight})")
+        print("=" * 80)
+        
+        # Log hyperparameters
+        config = {
+            'decoder_epochs': epochs,
+            'decoder_lr': lr,
+            'decoder_min_lr': min_lr,
+            'decoder_warmup_epochs': warmup_epochs,
+            'freeze_encoder': freeze_encoder,
+            'use_fk_consistency': use_fk_consistency,
+            'use_angle_axis_loss': use_angle_axis_loss,
+            'fk_loss_weight': fk_loss_weight,
+            'angle_axis_loss_weight': angle_axis_loss_weight,
+            'decoder_type': type(self.decoder).__name__,
+            'encoder_type': type(self.model).__name__,
+        }
+        self.logger.log_hyperparameters(config)
+        
+        self.load(model_path)
+        self.model.to(self.device)
+        self.decoder.to(self.device)
+        
+        # Set encoder mode
+        if freeze_encoder:
+            self.model.eval()
+            for param in self.model.parameters():
+                param.requires_grad = False
+            print("✓ Encoder frozen")
+        else:
+            self.model.train()
+            for param in self.model.parameters():
+                param.requires_grad = True
+            print("⚠ Encoder unfrozen - joint training mode")
+        
+        # Setup optimizers
+        if freeze_encoder:
+            decoder_optimizer = torch.optim.AdamW(
+                self.decoder.parameters(),
+                lr=lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.01
+            )
+        else:
+            # Joint training: different learning rates
+            decoder_optimizer = torch.optim.AdamW([
+                {'params': self.model.parameters(), 'lr': lr * 0.1},  # Smaller LR for encoder
+                {'params': self.decoder.parameters(), 'lr': lr}
+            ], betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+        
+        # Learning rate scheduler
+        decoder_scheduler = WarmupCosineAnnealingLR(
+            decoder_optimizer,
+            warmup_epochs=warmup_epochs,
+            total_epochs=epochs,
+            min_lr=min_lr
+        )
+        
+        # Load checkpoint if needed
+        if load:
+            self.load(load_path, torch.optim.AdamW(self.model.parameters()), decoder_optimizer)
+            print(f"✓ Loaded checkpoint from {load_path}")
+        
+        # Training loop
+        for epoch in range(epochs):
+            self.decoder.train()
+            if not freeze_encoder:
+                self.model.train()
+            
+            total_loss = 0.0
+            total_fk_loss = 0.0
+            total_angle_axis_loss = 0.0
+            total_fk_position_error = 0.0
+            total_angle_axis_error = 0.0
+            
+            for i, data in enumerate(tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{epochs} - Decoder Training')):
+                if self.use_reference_actions:
+                    data, _ = data
+                data = data.to(self.device)
+                
+                decoder_optimizer.zero_grad()
+                
+                # Extract pose data
+                pose_body = data[:, 3:66]
+                pose_hand = data[:, 66:] if self.load_hands else None
+                data_input = data[:, 3:]  # Remove root orientation
+                
+                # Forward pass through encoder
+                if freeze_encoder:
+                    with torch.no_grad():
+                        actions, _ = self._model_forward(data_input)
+                else:
+                    actions, _ = self._model_forward(data_input)
+                
+                # Decoder: actions -> reconstructed angle-axis
+                pose_body_recon = self.decoder(actions)
+                
+                loss = torch.tensor(0.0, device=self.device)
+                
+                # Loss 1: FK Consistency Loss
+                if use_fk_consistency:
+                    # Create body parameters for reconstructed pose
+                    body_parms_recon = self.create_model_input(
+                        pose_body=pose_body_recon,
+                        pose_hand=pose_hand
+                    )
+                    
+                    # Compute FK for reconstructed pose
+                    joints_recon = self.body_model(**body_parms_recon).Jtr
+                    body_parms = self.create_model_input(
+                        pose_body=pose_body,
+                        pose_hand=pose_hand
+                    )
+                    joints_gt = self.body_model(**body_parms).Jtr
+                    
+                    # Compute FK consistency loss
+                    fk_loss = F.mse_loss(joints_recon, joints_gt.detach())
+                    loss += fk_loss * fk_loss_weight
+                    total_fk_loss += fk_loss.item()
+                
+                # Loss 2: Direct Angle-Axis Reconstruction Loss
+                if use_angle_axis_loss:
+                    angle_axis_loss = F.mse_loss(pose_body_recon, pose_body.detach())
+                    loss += angle_axis_loss * angle_axis_loss_weight
+                    total_angle_axis_loss += angle_axis_loss.item()
+                    
+                    # Track angle-axis error
+                    angle_axis_error = F.l1_loss(pose_body_recon, pose_body.detach())
+                    total_angle_axis_error += angle_axis_error.item()
+                
+                total_loss += loss.item()
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
+                if not freeze_encoder:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                decoder_optimizer.step()
+            
+            # Calculate average losses
+            num_batches = len(self.train_loader)
+            decoder_metrics = {
+                'epoch': epoch + 1,
+                'total_loss': total_loss / num_batches,
+                'lr': decoder_scheduler.get_last_lr()[0],
+            }
+            
+            if use_fk_consistency:
+                decoder_metrics['fk_loss'] = total_fk_loss / num_batches
+                decoder_metrics['fk_position_error'] = total_fk_position_error / num_batches
+            
+            if use_angle_axis_loss:
+                decoder_metrics['angle_axis_loss'] = total_angle_axis_loss / num_batches
+                decoder_metrics['angle_axis_error'] = total_angle_axis_error / num_batches
+                
+            if visualize:
+                save_dir = f'{self.save_dir}/figs'
+                save_dir_gt = f'{save_dir}/gt_decoder_epoch_{epoch+1}.png'
+                save_dir_recon = f'{save_dir}/recon_decoder_epoch_{epoch+1}.png'
+                
+                body_parms_recon = self.create_model_input(
+                    pose_body=pose_body_recon,
+                    pose_hand=pose_hand
+                )
+                body_parms_gt = self.create_model_input(
+                    pose_body=pose_body,
+                    pose_hand=pose_hand
+                )               
+
+                self.renderer.render_pose_amass_with_bm(body_parms=body_parms_gt, save_path=save_dir_gt, add_smpl_fits=False, update_mv=False)
+                self.renderer.render_pose_amass_with_bm(body_parms=body_parms_recon, save_path=save_dir_recon, add_smpl_fits=False, update_mv=False)
+                
+                # concatenate the images
+                os.system(f'convert {save_dir_gt} {save_dir_recon} +append {save_dir}/concat_decoder_epoch_{epoch+1}.png')
+                os.system(f'rm {save_dir_gt} {save_dir_recon}')
+                
+                
+
+            # Log training metrics
+            self.logger.log_metrics(decoder_metrics, step=epoch, prefix="decoder_train")
+            
+            # Print formatted statistics
+            print(self.logger.format_metrics_table(decoder_metrics, f"DECODER TRAINING - EPOCH {epoch + 1}"))
+            
+            # Validation
+            if epoch % validation_interval == 0:
+                val_decoder_metrics = self.validate_decoder(
+                    use_fk_consistency=use_fk_consistency,
+                    use_angle_axis_loss=use_angle_axis_loss,
+                    fk_loss_weight=fk_loss_weight,
+                    angle_axis_loss_weight=angle_axis_loss_weight,
+                    freeze_encoder=freeze_encoder,
+                    epoch=epoch,
+                    visualize=visualize,
+                    save_figs=save_figs,
+                    **kwargs
+                )
+            
+            # Save checkpoint
+            if epoch % save_interval == 0:
+                save_dir = f'{self.save_dir}/models'
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                
+                date = time.strftime("%d_%H_%M")
+                # Need a dummy encoder optimizer for save function
+                dummy_encoder_opt = torch.optim.AdamW(self.model.parameters())
+                self.save(
+                    f'{save_dir}/decoder_{date}_epoch_{epoch}.pt',
+                    optimizer=dummy_encoder_opt,
+                    decoder_optimizer=decoder_optimizer
+                )
+                print(f"✓ Saved decoder checkpoint at epoch {epoch}")
+            
+            decoder_scheduler.step()
+        
+        # Restore encoder state if it was frozen
+        if freeze_encoder:
+            for param in self.model.parameters():
+                param.requires_grad = True
+            print("\n✓ Encoder unfrozen after decoder training")
+        
+        print("\n" + "=" * 80)
+        print("DECODER TRAINING COMPLETED")
+        print("=" * 80)
+
+    def validate_decoder(self,
+                        use_fk_consistency: bool = True,
+                        use_angle_axis_loss: bool = True,
+                        fk_loss_weight: float = 1.0,
+                        angle_axis_loss_weight: float = 0.1,
+                        freeze_encoder: bool = True,
+                        epoch: int = 0,
+                        visualize: bool = False,
+                        save_figs: bool = False,
+                        **kwargs):
+        '''
+        Validate the decoder
+        '''
+        self.decoder.eval()
+        if freeze_encoder:
+            self.model.eval()
+        
+        with torch.no_grad():
+            total_loss = 0.0
+            total_fk_loss = 0.0
+            total_angle_axis_loss = 0.0
+            total_fk_position_error = 0.0
+            total_angle_axis_error = 0.0
+            
+            for i, data in enumerate(tqdm(self.test_loader, desc=f'Epoch {epoch+1} - Decoder Validation')):
+                if self.use_reference_actions:
+                    data, _ = data
+                data = data.to(self.device)
+                
+                # Extract pose data
+                pose_body = data[:, 3:66]
+                pose_hand = data[:, 66:] if self.load_hands else None
+                data_input = data[:, 3:]
+                
+                # Forward pass
+                actions, _ = self._model_forward(data_input)
+                pose_body_recon = self.decoder(actions)
+                
+                loss = torch.tensor(0.0, device=self.device)
+                
+                # FK Consistency Loss
+                if use_fk_consistency:
+                    # Create body parameters for reconstructed pose
+                    body_parms_recon = self.create_model_input(
+                        pose_body=pose_body_recon,
+                        pose_hand=pose_hand
+                    )
+                    
+                    # Compute FK for reconstructed pose
+                    joints_recon = self.body_model(**body_parms_recon).Jtr
+                    body_parms = self.create_model_input(
+                        pose_body=pose_body,
+                        pose_hand=pose_hand
+                    )
+                    joints_gt = self.body_model(**body_parms).Jtr
+                    
+                    # Compute FK consistency loss
+                    fk_loss = F.mse_loss(joints_recon, joints_gt)
+                    loss += fk_loss * fk_loss_weight
+                    total_fk_loss += fk_loss.item()
+                    
+                    # Track position error (optional, for monitoring)
+                    fk_position_error = torch.norm(joints_recon - joints_gt, dim=-1).mean()
+                    total_fk_position_error += fk_position_error.item()
+                
+                # Angle-Axis Reconstruction Loss
+                if use_angle_axis_loss:
+                    angle_axis_loss = F.mse_loss(pose_body_recon, pose_body)
+                    loss += angle_axis_loss * angle_axis_loss_weight
+                    total_angle_axis_loss += angle_axis_loss.item()
+                    
+                    angle_axis_error = F.l1_loss(pose_body_recon, pose_body)
+                    total_angle_axis_error += angle_axis_error.item()
+                
+                total_loss += loss.item()
+            
+            # Calculate average losses
+            num_batches = len(self.test_loader)
+            val_decoder_metrics = {
+                'total_loss': total_loss / num_batches,
+            }
+            
+            if use_fk_consistency:
+                val_decoder_metrics['fk_loss'] = total_fk_loss / num_batches
+                val_decoder_metrics['fk_position_error'] = total_fk_position_error / num_batches
+            
+            if use_angle_axis_loss:
+                val_decoder_metrics['angle_axis_loss'] = total_angle_axis_loss / num_batches
+                val_decoder_metrics['angle_axis_error'] = total_angle_axis_error / num_batches
+            
+            # Visualization for validation
+            if visualize and self.renderer is not None:
+                save_dir = f'{self.save_dir}/figs'
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                    
+                save_dir_gt = f'{save_dir}/gt_decoder_val_epoch_{epoch+1}.png'
+                save_dir_recon = f'{save_dir}/recon_decoder_val_epoch_{epoch+1}.png'
+                
+                body_parms_recon = self.create_model_input(
+                    pose_body=pose_body_recon,
+                    pose_hand=pose_hand
+                )
+                body_parms_gt = self.create_model_input(
+                    pose_body=pose_body,
+                    pose_hand=pose_hand
+                )               
+
+                self.renderer.render_pose_amass_with_bm(body_parms=body_parms_gt, save_path=save_dir_gt, update_mv=False, add_smpl_fits=False)
+                self.renderer.render_pose_amass_with_bm(body_parms=body_parms_recon, save_path=save_dir_recon, add_smpl_fits=False, update_mv=False)
+                
+                # concatenate the images
+                os.system(f'convert {save_dir_gt} {save_dir_recon} +append {save_dir}/concat_decoder_val_epoch_{epoch+1}.png')
+                os.system(f'rm {save_dir_gt} {save_dir_recon}')
+            
+            # Log validation metrics
+            self.logger.log_metrics(val_decoder_metrics, step=epoch, prefix="decoder_val")
+            
+            # Print formatted statistics
+            print(self.logger.format_metrics_table(val_decoder_metrics, f"DECODER VALIDATION - EPOCH {epoch + 1}"))
+            
+            return val_decoder_metrics
+
+
+if __name__ == "__main__":
+    from GBC.utils.base.assets import DATA_PATHS
+    # mapping_table = {
+    #     'Pelvis': 'base_link',
+    #     'L_Hip': 'Link_hip_l_yaw',
+    #     'R_Hip': 'Link_hip_r_yaw',
+    #     'L_Knee': 'Link_knee_l_pitch',
+    #     'R_Knee': 'Link_knee_r_pitch',
+    #     'L_Ankle': 'Link_ankle_l_pitch',
+    #     'R_Ankle': 'Link_ankle_r_pitch',
+    #     'L_Toe': 'Link_ankle_l_roll',
+    #     'R_Toe': 'Link_ankle_r_roll',
+    #     'L_Shoulder': 'Link_arm_l_01',
+    #     'R_Shoulder': 'Link_arm_r_01',
+    #     'L_Elbow': 'Link_arm_l_04',
+    #     'R_Elbow': 'Link_arm_r_04',
+    #     'L_Wrist': 'Link_arm_l_06',
+    #     'R_Wrist': 'Link_arm_r_06',
+    #     'Head': 'Link_head_yaw'
+    # }
+
+    mapping_table = {
+        'Pelvis': 'pelvis',
+        'L_Hip': 'left_hip_yaw_link',
+        'R_Hip': 'right_hip_yaw_link',
+        'L_Knee': 'left_knee_link',
+        'R_Knee': 'right_knee_link',
+        'L_Ankle': 'left_ankle_pitch_link',
+        'R_Ankle': 'right_ankle_pitch_link',
+        # 'L_Toe': 'left_ankle_roll_link',
+        # 'R_Toe': 'right_ankle_roll_link',
+        'L_Shoulder': 'left_shoulder_pitch_link',
+        'R_Shoulder': 'right_shoulder_pitch_link',
+        'L_Elbow': 'left_elbow_link',
+        'R_Elbow': 'right_elbow_link',
+        'L_Wrist': 'left_wrist_yaw_link',
+        'R_Wrist': 'right_wrist_yaw_link',
+        # 'Head': 'Link_head_yaw'
+    }
+    joint_weights = torch.Tensor([
+        1.0, # pelvis
+        1.0, # l_hip
+        1.0, # r_hip
+        1.5, # l_knee
+        1.5, # r_knee
+        4.0, # l_ankle
+        4.0, # r_ankle
+        1.0, # l_shoulder
+        1.0, # r_shoulder
+        1.5, # l_elbow
+        1.5, # r_elbow
+        2.0, # l_wrist
+        2.0, # r_wrist        
+    ])
+    
+    joint_mapping_table = {
+        "L_Ankle": {
+            "pitch": "left_ankle_pitch_joint",
+            "roll": "left_ankle_roll_joint",
+        },
+        "R_Ankle": {
+            "pitch": "right_ankle_pitch_joint",
+            "roll": "right_ankle_roll_joint",
+        },
+        "L_Hip": {
+            "yaw": "left_hip_yaw_joint",
+            "pitch": "left_hip_pitch_joint",
+            "roll": "left_hip_roll_joint",
+        },
+        "R_Hip": {
+            "yaw": "right_hip_yaw_joint",
+            "pitch": "right_hip_pitch_joint",
+            "roll": "right_hip_roll_joint",
+        },
+    }
+
+    # Custom loss coefficients configuration
+    custom_loss_coeffs = LossCoefficients(
+        main_loss=5000.0,
+        aux_loss=1.0,
+        out_of_range_loss=1000.0,
+        high_value_action_loss=1000.0,
+        direct_mapping_loss=1000.0,
+        symmetry_loss=1000.0,
+        reference_action_loss=5000.0,
+        bone_direction_loss=50.0,
+        disturbance_base=1.0,
+    )
+
+    
+
+    smplh_model_path=DATA_PATHS.smplh_model_path
+    dmpls_model_path=DATA_PATHS.dmpls_model_path
+    # urdf_path="/home/rl/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf"
+    urdf_path=DATA_PATHS.urdf_path
+    dataset_path=DATA_PATHS.dataset_path
+    # smpl_fits_dir=DATA_PATHS.smplh_fit_result_path
+    smpl_fits_dir = "fit_h1_2/new_best_fit_org.pt"
+    device = 'cuda:1'
+    batch_size = 256
+    ik_batch_size = 1024
+    from GBC.utils.data_preparation.robot_flip_left_right import UnitreeH12FlipLeftRight
+    save_dir = 'fit_h1_2_simplified'
+    trainer = PoseFormerTrainer(
+    urdf_path=urdf_path,
+    dataset_path=dataset_path + "/AMASS_FULL",
+    device=device,
+    batch_size=batch_size,
+    mapping_table=mapping_table,
+    smplh_model_path=smplh_model_path,
+    dmpls_model_path=dmpls_model_path,
+    smpl_fits_dir=smpl_fits_dir,
+    # secondary_dir="ACCAD",
+    use_renderer=True,
+    sample_steps=10,
+    save_dir=save_dir,
+    loss_coefficients=custom_loss_coeffs,
+    use_wandb=True,
+    wandb_project="pose_transformer_simplified_h1_training",
+    )
+
+    
+    flipper = UnitreeH12FlipLeftRight(cfg=BaseCfg())
+    trainer.set_flip_left_right(flipper)
+    force_retrain = True
+    if not os.path.exists(save_dir) or force_retrain:
+        trainer.train(
+            epochs=1000, 
+            lr=1e-4, 
+            min_lr=1e-6,
+            warmup_epochs=20,
+            validation_interval=1, 
+            # criterion=torch.nn.HuberLoss(delta=0.1), 
+            criterion=torch.nn.MSELoss(),
+            save_interval=5, 
+            save_figs=True, 
+            apply_symmetry=True, 
+            apply_noise=True, 
+            visualize=False, 
+            link_trans_offset=None, 
+            load=False, 
+            joint_weights=joint_weights,
+            disturbance_min_coeff=100.0,
+            disturbance_max_coeff=200.0
+        )

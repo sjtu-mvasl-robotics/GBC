@@ -195,8 +195,11 @@ class RobotVisualizer:
                         mesh_pts = np.einsum("ij, kj -> ki", mesh_tf[:3, :3], mesh_pts) + mesh_tf[np.newaxis, :3, 3]
                     self.scene.set_pose(nodes[0], mesh_tf)
                 else:
-                    self.deleted_nodes.append(nodes[0])
-                    self.scene.remove_node(nodes[0])
+                    try:
+                        self.deleted_nodes.append(nodes[0])
+                        self.scene.remove_node(nodes[0])
+                    except Exception as e:
+                        print(f"Error removing node {nodes[0]}: {e}")
 
 
     def add_axes(self, transforms: np.ndarray, length, color):
@@ -235,3 +238,12 @@ class RobotVisualizer:
                 pose=matrix
             ))
 
+
+if __name__ == "__main__":
+    from GBC.utils.base.assets import DATA_PATHS
+    from PIL import Image
+
+    urdf_path = DATA_PATHS.urdf_path
+    vis = RobotVisualizer(urdf_path)
+    q = torch.zeros(vis.num_joints)
+    Image.fromarray(vis(q)).save("test_vis.png")

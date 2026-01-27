@@ -8,6 +8,8 @@ from isaaclab.utils import configclass
 class RslRlRefPpoActorCriticCfg:
     class_name: str = MISSING
     max_len: int = MISSING
+    
+    # For MMGPT and MMTransformerV2
     dim_model: int = MISSING
     num_layers: int = MISSING
     num_heads: int = MISSING
@@ -15,14 +17,27 @@ class RslRlRefPpoActorCriticCfg:
     init_noise_std: float = MISSING
     max_seq_len: int = 24
     mlp_hidden_dims: list[int] = []
+    
+    
     apply_rope: bool = True
     load_dagger: bool = False
     load_dagger_path: str | None = None
     load_actor_path: str | None = None
+    load_critic_path: str | None = None
+    load_std_path: str | None = None
     apply_mlp_residual: bool = False
     history_length: int = 1
     concatenate_term_names: dict[str, list[list[str]]] | None = None
     concatenate_ref_term_names: dict[str, list[list[str]]] | None = None
+    pred_obs_term_names: list[str] | None = None
+    pred_obs_term_weights: list[float] | None = None
+    use_mlp_dagger: bool = False
+    dagger_history_length: int = 1  # only used if use_mlp_dagger is True
+    # For MM-MLP
+    actor_hidden_dims: list[int] = MISSING
+    critic_hidden_dims: list[int] = MISSING
+    activation: str = "elu"
+    fusion_mode: Literal['gated', 'concat', 'attention'] = "gated"
 
 @configclass
 class RslRlRefPpoAmpNetCfg:
@@ -65,6 +80,7 @@ class RslRlRefPpoAlgorithmCfg:
     max_lr_restriction_epoch: int = 2500
     min_lr_after_certain_epoch: float = 1e-5
     min_lr_restriction_epoch: int = 2500
+    fix_sigma: bool = False
     
     # beginning of MMPPO config
     num_learning_epochs: int = MISSING
@@ -74,7 +90,7 @@ class RslRlRefPpoAlgorithmCfg:
     teacher_coef_range: tuple[float, float] | None = None
     teacher_coef_decay: float | None = None
     teacher_coef_decay_interval: int = 100
-    teacher_coef_mode: str = "kl" # "kl" or "norm"
+    teacher_coef_mode: str = "kl" # "kl", "norm", "original_kl", "mse", "huber"
     teacher_loss_coef: float | None = None
     teacher_loss_coef_range: tuple[float, float] | None = None
     teacher_loss_coef_decay: float | None = None
@@ -84,6 +100,7 @@ class RslRlRefPpoAlgorithmCfg:
     teacher_updating_intervals: int = 0
     teacher_lr: float = 5e-4
     teacher_only_interval: int = 0
+    hybrid_training_intervals: int = 0
     rnd_cfg: dict | None = None
     symmetry_cfg: dict | None = None
     amp_cfg: RslRlPpoAmpCfg | None = None

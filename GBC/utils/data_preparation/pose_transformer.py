@@ -23,8 +23,8 @@ class PoseTransformer(nn.Module):
     def __init__(self, 
                  load_hands: bool = False,
                  num_actions: int = 29,
-                 embedding_dim: int = 64,
-                 joint_embedding_dim: int = 256,
+                 embedding_dim: int = 32,
+                 joint_embedding_dim: int = 128,
                  num_heads: int = 4,
                  num_layers: int = 4
                 ):
@@ -318,3 +318,143 @@ class PoseTransformerV2(nn.Module):
         
         feature = x[:, 0]
         return self.decoder_head(feature)
+
+
+class PoseTransformerDecoder(nn.Module):
+    '''
+    Pose Transformer Decoder (Inverse Model) - Structurally Symmetric Architecture
+
+    Decoder that mirrors the PoseTransformer (Encoder) structure step-by-step.
+    This ensures the decoder can properly reverse the encoding process.
+    
+    Encoder (P) flow:
+        x (N, 63) -> view(N, 21, 3) -> permute(N, 3, 21) 
+        -> joint_embedding(21->256) -> permute(N, 256, 3)
+        -> embedding(3->64) -> (N, 256, 64)
+        -> +pos_enc -> transformer -> mean(dim=1) -> (N, 64)
+        -> decoder(64->29) -> y (N, 29)
+    
+    Decoder (Q) flow (reverse):
+        y (N, 29) -> head_decoder(29->64) -> z (N, 64)
+        -> unsqueeze+repeat -> (N, 256, 64) -> +pos_enc
+        -> transformer -> (N, 256, 64)
+        -> reverse_embedding(64->3) -> (N, 256, 3)
+        -> permute(N, 3, 256) -> reverse_joint_embedding(256->21)
+        -> permute(N, 21, 3) -> view(N, 63) -> x (N, 63)
+
+    Args:
+        load_hands: Whether to include hand joints in the output
+        num_actions: Number of action dimensions (29 for H1)
+        embedding_dim: Must match encoder's embedding_dim (default: 64)
+        joint_embedding_dim: Must match encoder's joint_embedding_dim (default: 256)
+        num_heads: Number of attention heads
+        num_layers: Number of transformer encoder layers
+        dropout: Dropout rate
+
+    Shape:
+        - Input: (N, num_actions)
+        - Output: (N, num_joints * 3)
+    '''
+    def __init__(self, 
+                 load_hands: bool = False,
+                 num_actions: int = 29,
+                 embedding_dim: int = 64,
+                 joint_embedding_dim: int = 256,
+                 num_heads: int = 4,
+                 num_layers: int = 4,
+                 dropout: float = 0.1
+                ):
+        super(PoseTransformerDecoder, self).__init__()
+        self.num_joints = 21 if not load_hands else 51
+        self.output_dim = 3  # angle-axis representation
+        self.num_actions = num_actions
+        self.embedding_dim = embedding_dim
+        self.joint_embedding_dim = joint_embedding_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        # Step 1: Reverse the final decoder layer (29 -> 64)
+        # This inverts: P.decoder(z) -> y
+        self.head_decoder = nn.Sequential(
+            nn.Linear(num_actions, embedding_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dim * 2, embedding_dim)
+        )
+        
+        # Step 2: Positional encoding (same as encoder, will be reversed in usage)
+        self.positional_encoding = nn.Parameter(torch.zeros(1, joint_embedding_dim, embedding_dim))
+        
+        # Step 3: Transformer encoder (mirrors the encoder's transformer)
+        # Note: Using encoder here to reverse the information flow
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, 
+            nhead=num_heads,
+            dim_feedforward=embedding_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Step 4: Reverse the embedding layer (64 -> 3)
+        # This inverts: P.embedding(x) where x is (N, 256, 3)
+        self.reverse_embedding = nn.Linear(embedding_dim, self.output_dim)
+        
+        # Step 5: Reverse the joint embedding layer (256 -> 21)
+        # This inverts: P.joint_embedding(x) where x is (N, 3, 21)
+        self.reverse_joint_embedding = nn.Linear(joint_embedding_dim, self.num_joints)
+
+    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        '''
+        Forward pass - mirrors encoder in reverse
+
+        Args:
+            actions: Input action tensor (N, num_actions)
+
+        Returns:
+            Output angle-axis tensor (N, num_joints * 3)
+        '''
+        N = actions.shape[0]
+        
+        # Step 1: Reverse final decoder (29 -> 64)
+        # Inverts: z (N, 64) -> decoder -> y (N, 29)
+        z_hat = self.head_decoder(actions)  # (N, 64)
+        
+        # Step 2: Reverse the mean pooling operation
+        # Inverts: (N, 256, 64) -> mean(dim=1) -> (N, 64)
+        # We use repeat to broadcast z back to sequence
+        x = z_hat.unsqueeze(1).repeat(1, self.joint_embedding_dim, 1)  # (N, 256, 64)
+        
+        # Step 3: Add positional encoding (same as encoder)
+        x = x + self.positional_encoding  # (N, 256, 64)
+        
+        # Step 4: Transformer (refines the repeated features)
+        x = self.transformer(x)  # (N, 256, 64)
+        
+        # Step 5: Reverse embedding layer (64 -> 3)
+        # Inverts: (N, 256, 3) -> embedding -> (N, 256, 64)
+        x = self.reverse_embedding(x)  # (N, 256, 3)
+        
+        # Step 6: Permute to match encoder's intermediate shape
+        # Encoder does: (N, 3, 21) -> joint_embedding -> (N, 3, 256)
+        # We reverse: (N, 256, 3) -> permute -> (N, 3, 256)
+        x = x.permute(0, 2, 1)  # (N, 3, 256)
+        
+        # Step 7: Reverse joint embedding (256 -> 21)
+        # Inverts: (N, 3, 21) -> joint_embedding -> (N, 3, 256)
+        x = self.reverse_joint_embedding(x)  # (N, 3, 21)
+        
+        # Step 8: Permute back and flatten
+        # Inverts: (N, 21, 3) -> permute -> (N, 3, 21)
+        x = x.permute(0, 2, 1)  # (N, 21, 3)
+        
+        # Step 9: Flatten to (N, 63)
+        angle_axis = x.reshape(N, -1)  # (N, num_joints * 3)
+        
+        return angle_axis
+    
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if 'model' in state_dict.keys():
+            return super().load_state_dict(state_dict["model"], strict, assign)
+        return super().load_state_dict(state_dict, strict, assign)

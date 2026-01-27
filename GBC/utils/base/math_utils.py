@@ -1181,6 +1181,129 @@ def contact_to_phase(contact: torch.Tensor, threshold: float = 0.5) -> torch.Ten
 
     return alpha
 
+def batch_contact_to_phase(
+    contact: torch.Tensor, threshold: float = 0.5
+) -> torch.Tensor:
+    """
+    Convert a batch of 0/1 contact sequences into sin/cos phase channels.
+    Fully vectorized implementation without Python loops for maximum performance.
+
+    Args:
+        contact : 2-D torch.Tensor (int/bool) of shape (B, T). 0 = swing, 1 = stance
+        threshold : float, threshold for phase conversion (default: 0.5)
+    Returns:
+        alpha : 2-D torch.Tensor of shape (B, T), where sgn(sin(alpha * 2 * pi)) = contact
+    """
+    if contact.dim() == 1:
+        return contact_to_phase(contact, threshold)
+    assert contact.dim() == 2, "input must be 2-D (Batch, Time)"
+    assert 0.0 < threshold < 1.0, "threshold must be between 0 and 1"
+
+    B, T = contact.shape
+    device = contact.device
+    dtype = torch.float32  # Output must be float
+
+    # --- 1. Identify segments (consecutive 0s or 1s) ---
+    
+    # Find state change points (B, T-1) -> (B, T)
+    # segment_start_mask[b, t] = True if t=0 or contact[t] != contact[t-1]
+    diff = contact[:, 1:] != contact[:, :-1]
+    segment_start_mask = torch.cat(
+        [contact.new_ones(B, 1, dtype=torch.bool), diff], dim=1
+    )
+
+    # --- 2. Calculate each time point's index within its segment ---
+    # (i.e., torch.arange(L) for each segment of length L)
+    
+    # (B, T) arange [0, 1, ..., T-1]
+    arange_t = torch.arange(T, device=device).expand(B, -1)
+    
+    # (B, T) cummax trick: find segment_start_time for each t
+    # e.g., [0, 0, 0, 3, 3, 5, 5, 5, 5]
+    segment_start_t = torch.cummax(
+        arange_t * segment_start_mask, dim=1
+    )[0]
+    
+    # (B, T) ramp_idx: relative index within segment for each t
+    # e.g., [0, 1, 2, 0, 1, 0, 1, 2, 3]
+    ramp_idx = arange_t - segment_start_t
+
+    # --- 3. Calculate total length of each segment ---
+    # This is the hardest part: a parallel "group-by count"
+
+    # (B, T) segment_ids: assign unique segment ID for each t
+    # (IDs are unique within batch)
+    # e.g., [0, 0, 0, 1, 1, 2, 2, 2, 2]
+    segment_ids = torch.cumsum(segment_start_mask.int(), dim=1) - 1
+
+    # (B,) number of segments per batch
+    num_segments_per_batch = segment_ids[:, -1] + 1
+    # (int) max number of segments across entire batch
+    max_num_segments = num_segments_per_batch.max()
+
+    # (B,) bincount offset
+    batch_offset = torch.arange(
+        B, device=device, dtype=torch.long
+    ) * max_num_segments
+    
+    # (B, T) -> (B * T,)
+    # Flatten segment_ids, but make each batch's IDs unique via offset
+    # e.g., [0, 0, 0, 1, 1, 2, 2, 2, 2] (batch 0)
+    #       [3, 3, 4, 4, 4, 5, 5, 5, 5] (batch 1, assuming max=3)
+    segment_ids_unique_flat = (segment_ids + batch_offset.unsqueeze(1)).flatten()
+
+    # (B * T,)
+    # Count all IDs. counts[i] = length of segment with ID i
+    counts = torch.bincount(
+        segment_ids_unique_flat, 
+        minlength=B * max_num_segments
+    )
+
+    # (B * T,) -> (B, T)
+    # Use flattened IDs to "gather" corresponding lengths
+    segment_length_per_t_flat = counts[segment_ids_unique_flat]
+    segment_length_per_t = segment_length_per_t_flat.reshape(B, T)
+    # (B, T)
+    # e.g., [3, 3, 3, 2, 2, 4, 4, 4, 4]
+
+    # --- 4. Calculate normalized "ramp" (handle L=1 case) ---
+    
+    # (B, T)
+    # linspace(0, 1, L) = arange(L) / (L - 1)
+    # We need (L - 1), and protect against division by zero when L=1
+    segment_length_minus_one = (segment_length_per_t - 1).to(dtype)
+    
+    # Only perform division when L > 1
+    ramp_norm = torch.zeros_like(ramp_idx, dtype=dtype)
+    valid_mask = segment_length_per_t > 1
+    
+    # (B, T)
+    # When L=1, ramp_norm = 0.0 (corresponding to first element of linspace)
+    # When L>1, ramp_norm = ramp_idx / (L - 1)
+    ramp_norm[valid_mask] = ramp_idx[valid_mask].to(dtype) / \
+                            segment_length_minus_one[valid_mask]
+
+    # --- 5. Calculate final alpha based on contact state ---
+    
+    contact_float = contact.to(dtype)
+
+    # (B, T) ramp_start: 
+    # 1 (stance) -> 0.0
+    # 0 (swing)  -> threshold
+    ramp_start = (1.0 - contact_float) * threshold
+
+    # (B, T) ramp_span:
+    # 1 (stance) -> threshold
+    # 0 (swing)  -> 1.0 - threshold
+    ramp_span = contact_float * threshold + \
+                (1.0 - contact_float) * (1.0 - threshold)
+
+    # (B, T)
+    # alpha = start + t * span
+    alpha = ramp_start + ramp_norm * ramp_span
+    
+    return alpha
+
 
 def filt_feet_contact(
     actions: torch.Tensor,

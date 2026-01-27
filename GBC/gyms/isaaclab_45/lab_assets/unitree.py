@@ -275,14 +275,14 @@ H1_2_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{ISAACLAB_NUCLEUS_DIR}/Robots/Unitree/H1/h1.usd",
         activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
             linear_damping=0.0,
             angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
+            max_linear_velocity=5.0,
+            max_angular_velocity=5.0,
+            max_depenetration_velocity=10.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False, solver_position_iteration_count=4, solver_velocity_iteration_count=4
@@ -381,7 +381,7 @@ G1_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.74),
+        pos=(0.0, 0.0, 0.8),
         joint_pos={
             ".*_hip_pitch_joint": -0.20,
             ".*_knee_joint": 0.42,
@@ -472,18 +472,12 @@ G1_CFG = ArticulationCfg(
 )
 """Configuration for the Unitree G1 Humanoid robot."""
 
-
-G1_MINIMAL_CFG = G1_CFG.copy()
-G1_MINIMAL_CFG.spawn.usd_path = f"{ISAACLAB_NUCLEUS_DIR}/Robots/Unitree/G1/g1_minimal.usd"
-"""Configuration for the Unitree G1 Humanoid robot with fewer collision meshes.
-
-This configuration removes most collision meshes to speed up simulation.
-"""
 G1_29DOF_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"/home/yifei/codespace/GBC_45/robots_usd/unitee_g1.usd",
+        # usd_path="/home/yifei/dataset/unitree_ros/g1_29dof_urdf.usd",
         activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
             linear_damping=0.0,
@@ -497,92 +491,77 @@ G1_29DOF_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.74),
+        pos=(0.0, 0.0, 0.8),
         joint_pos={
-            # ".*_hip_pitch_joint": -0.20,
-            # ".*_hip_roll_joint": 0.00,
-            # ".*_hip_yaw_joint": 0.00,
-            # ".*_knee_joint": 0.42,
-            # ".*_ankle_pitch_joint": -0.23,
-            # ".*_ankle_roll_joint": 0.00,
-            # "waist_.*_joint":0.00,
-        
-            
-            # "left_elbow_joint": 0.00,
-            # "left_shoulder_roll_joint": 0.16,
-            # "left_shoulder_pitch_joint": 0.35,
-            # "left_shoulder_yaw_joint": 0.00,
-            # "left_wrist_roll_joint":0.00,
-            # "left_wrist_pitch_joint":0.00,
-            # "left_wrist_yaw_joint":0.00,
-            
-            # "right_elbow_joint": 0.00,
-            # "right_shoulder_roll_joint": -0.16,
-            # "right_shoulder_pitch_joint": 0.35,
-            # "right_shoulder_yaw_joint": 0.00,
-            # "right_wrist_roll_joint":0.00,
-            # "right_wrist_pitch_joint":0.00,
-            # "right_wrist_yaw_joint":0.00,
-            ".*":0.0,
-            
-            
-            # "left_one_joint": 1.0,
-            # "right_one_joint": -1.0,
-            # "left_two_joint": 0.52,
-            # "right_two_joint": -0.52,
+            ".*_hip_pitch_joint": -0.20,
+            ".*_knee_joint": 0.42,
+            "waist_yaw_joint": 0.0,
+            "waist_roll_joint": 0.0,
+            "waist_pitch_joint": 0.0,
+            "left_shoulder_roll_joint": 0.16,
+            "left_shoulder_pitch_joint": 0.35,
+            "right_shoulder_roll_joint": -0.16,
+            "right_shoulder_pitch_joint": 0.35,
+            ".*_elbow_joint": 0.0,
+            ".*_wrist_roll_joint": 0.0,
+            ".*_wrist_pitch_joint": 0.0,
+            ".*_wrist_yaw_joint": 0.0,
         },
+        # joint_pos={
+        #     ".*": 0.0, # MUST SET TO ZERO FOR REFERENCE POSE TO WORK
+        # },
         joint_vel={".*": 0.0},
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[
-                ".*_hip_yaw_joint",
-                ".*_hip_roll_joint",
                 ".*_hip_pitch_joint",
+                ".*_hip_roll_joint",
+                ".*_hip_yaw_joint",
                 ".*_knee_joint",
-                # "torso_joint",
-                # ".*_ankle_pitch_joint",
-                # "waist_.*_joint",
-            
-                
-        
             ],
-            effort_limit=300,
-            velocity_limit=100.0,
+            effort_limit_sim=300,
+            velocity_limit_sim=100.0,
             stiffness={
-                ".*_hip_yaw_joint": 150.0,
-                ".*_hip_roll_joint": 150.0,
                 ".*_hip_pitch_joint": 200.0,
+                ".*_hip_roll_joint": 150.0,
+                ".*_hip_yaw_joint": 150.0,
                 ".*_knee_joint": 200.0,
-                # "torso_joint": 200.0,
-            
             },
             damping={
-                ".*_hip_yaw_joint": 5.0,
-                ".*_hip_roll_joint": 5.0,
                 ".*_hip_pitch_joint": 5.0,
+                ".*_hip_roll_joint": 5.0,
+                ".*_hip_yaw_joint": 5.0,
                 ".*_knee_joint": 5.0,
-                # "torso_joint": 5.0,
             },
             armature={
                 ".*_hip_.*": 0.01,
                 ".*_knee_joint": 0.01,
-                # "torso_joint": 0.01,
             },
         ),
-        "waists": ImplicitActuatorCfg(
-            joint_names_expr=[
-                "waist_.*_joint",
-            ],
-            effort_limit=300,
-            velocity_limit=100.0,
-            stiffness=150,
-            damping=5.0,
-            armature=0.01,
+        "waist": ImplicitActuatorCfg(
+            joint_names_expr=["waist_.*_joint"],
+            effort_limit_sim=300,
+            velocity_limit_sim=100.0,
+            stiffness={
+                "waist_yaw_joint": 200.0,
+                "waist_roll_joint": 200.0,
+                "waist_pitch_joint": 200.0,
+            },
+            damping={
+                "waist_yaw_joint": 5.0,
+                "waist_roll_joint": 5.0,
+                "waist_pitch_joint": 5.0,
+            },
+            armature={
+                "waist_yaw_joint": 0.01,
+                "waist_roll_joint": 0.01,
+                "waist_pitch_joint": 0.01,
+            },
         ),
         "feet": ImplicitActuatorCfg(
-            effort_limit=20,
+            effort_limit_sim=20,
             joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
             stiffness=20.0,
             damping=2.0,
@@ -590,17 +569,14 @@ G1_29DOF_CFG = ArticulationCfg(
         ),
         "arms": ImplicitActuatorCfg(
             joint_names_expr=[
-                
-                ".*_elbow_joint",
-                ".*_shoulder_roll_joint",
                 ".*_shoulder_pitch_joint",
+                ".*_shoulder_roll_joint",
                 ".*_shoulder_yaw_joint",
-                ".*_wrist_roll_joint",
-                ".*_wrist_pitch_joint",
-                ".*_wrist_yaw_joint",
+                ".*_elbow_joint",
+                ".*_wrist_.*",
             ],
-            effort_limit=300,
-            velocity_limit=100.0,
+            effort_limit_sim=300,
+            velocity_limit_sim=100.0,
             stiffness=40.0,
             damping=10.0,
             armature={
@@ -611,3 +587,12 @@ G1_29DOF_CFG = ArticulationCfg(
         ),
     },
 )
+"""Configuration for the Unitree G1 Humanoid robot."""
+
+
+G1_MINIMAL_CFG = G1_CFG.copy()
+G1_MINIMAL_CFG.spawn.usd_path = f"{ISAACLAB_NUCLEUS_DIR}/Robots/Unitree/G1/g1_minimal.usd"
+"""Configuration for the Unitree G1 Humanoid robot with fewer collision meshes.
+
+This configuration removes most collision meshes to speed up simulation.
+"""

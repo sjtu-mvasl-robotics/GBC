@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from GBC.utils.data_preparation.data_preparation_cfg import *
 from torchaudio_filters import LowPass
 from tqdm import tqdm
-from GBC.utils.base.math_utils import rot_mat_to_vec, rot_vec_to_mat, quaternion_to_angle_axis, find_longest_cyclic_subsequence, angle_axis_to_quaternion, batch_angle_axis_to_ypr, interpolate_trans, pad_to_len, filt_feet_contact, hampel_filter, quat_inv, quat_conjugate, quat_rotate, q_mul, quat_rotate_inverse, quat_fix, unwrap_and_smooth_rot_vecs, smooth_quat_savgol
+from GBC.utils.base.math_utils import rot_mat_to_vec, rot_vec_to_mat, quaternion_to_angle_axis, find_longest_cyclic_subsequence, angle_axis_to_quaternion, batch_angle_axis_to_ypr, interpolate_trans, pad_to_len, filt_feet_contact, hampel_filter, quat_inv, quat_conjugate, quat_rotate, q_mul, quat_rotate_inverse, quat_fix, unwrap_and_smooth_rot_vecs, smooth_quat_savgol, batch_rot_vec_to_mat
 from GBC.utils.base.rotation_repair import repair_rotation_sequence
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -18,6 +18,8 @@ from copy import deepcopy
 from GBC.utils.base import DATA_PATHS
 from GBC.utils.data_preparation.robot_flip_left_right import RobotFlipLeftRight, flip_rot_mat_left_right
 from human_body_prior.body_model.body_model import BodyModel
+
+import time
 
 def adjust_shape_0(sequence: torch.Tensor, shape_0: int):
     if sequence.shape[0] > shape_0:
@@ -135,6 +137,14 @@ o be adjusted (T, 3)
         
         return root_orient
     
+    def get_root_orient(self, root_quat):
+        root_quat = quat_fix(root_quat)  # Ensure quaternion is continuous
+        # root_quat = smooth_quat_savgol(root_quat, window_size=11, polyorder=3)
+        root_quat = F.normalize(root_quat, p=2, dim=1)
+        root_orient = quaternion_to_angle_axis(root_quat)
+        
+        return root_orient, root_quat
+    
     def get_projected_gravity(self, root_orient: torch.Tensor):
         '''
             Get the projected gravity vector in the global coordinate
@@ -145,9 +155,15 @@ o be adjusted (T, 3)
             Returns:
                 torch.Tensor: The projected gravity vector (T, 3)
         '''
-        gravity = torch.tensor([0, 0, -1], dtype=torch.float32, device=self.device).repeat(root_orient.shape[0], 1) # (T, 3) gravity vector with normalized length
-        root_rot_mat = rot_vec_to_mat(root_orient) # (T, 3, 3)
-        gravity = torch.einsum("ijk, ik -> ij", root_rot_mat, gravity) # (T, 3)
+        
+        if len(root_orient.shape) == 2: # (T, 3)
+            gravity = torch.tensor([0, 0, -1], dtype=torch.float32, device=self.device).repeat(root_orient.shape[0], 1) # (T, 3) gravity vector with normalized length
+            root_rot_mat = rot_vec_to_mat(root_orient) # (T, 3, 3)
+            gravity = torch.einsum("ijk, ik -> ij", root_rot_mat, gravity) # (T, 3)
+        else: # (B, T, 3)
+            gravity = torch.tensor([0, 0, -1], dtype=torch.float32, device=self.device).repeat(root_orient.shape[1], 1) # (T, 3) gravity vector with normalized length
+            root_rot_mat = batch_rot_vec_to_mat(root_orient) # (B, T, 3, 3)
+            gravity = torch.einsum('bijk, ik -> bij', root_rot_mat, gravity) # (B, T, 3)
         return gravity
 
     def get_yaw_only_rot_mat(self, rot_mat):
@@ -263,7 +279,7 @@ o be adjusted (T, 3)
 
     def calc_ang_vel_world(self, rot_vec, fps):
         rot_quat = angle_axis_to_quaternion(rot_vec)
-        # rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
+        rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
         # rot_quat = self.filt(rot_quat)
         delta_q = q_mul(rot_quat[1:], quat_inv(rot_quat[:-1])) # quaternion diff
         neg_w_mask = delta_q[..., 0] < 0
@@ -277,10 +293,16 @@ o be adjusted (T, 3)
         ang_vel = torch.cat([ang_vel, ang_vel[-1:]], dim=0)
 
         return ang_vel
+    
+    def compute_root_quat(self, rot_vec):
+        rot_quat = angle_axis_to_quaternion(rot_vec)
+        rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
+        rot_quat = smooth_quat_savgol(rot_quat, window_size=11, polyorder=3)
+        return rot_quat
 
     def calc_ang_vel(self, rot_vec, fps):
         rot_quat = angle_axis_to_quaternion(rot_vec)
-        # rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
+        rot_quat = quat_fix(rot_quat)  # Ensure quaternion is continuous
         # rot_quat = self.filt(rot_quat)
         delta_q = q_mul(rot_quat[1:], quat_inv(rot_quat[:-1])) # quaternion diff
         neg_w_mask = delta_q[..., 0] < 0
@@ -317,6 +339,7 @@ o be adjusted (T, 3)
 
     def add_extra_data_from_poses(self, data_dict):
         # data_dict["lin_vel"], data_dict["lin_vel_orig"] = self.calc_lin_vel_yaw_frame(data_dict["trans"], data_dict["root_orient"], data_dict["fps"])
+        data_dict["root_quat"] = self.compute_root_quat(data_dict["root_orient"])
         data_dict["lin_vel"] = self.calc_lin_vel(data_dict["trans"], data_dict["root_orient"], data_dict["fps"])
         data_dict["lin_vel_orig"] = self.calc_lin_vel_world(data_dict["trans"], data_dict["root_orient"], data_dict["fps"])
         data_dict["ang_vel"] = self.calc_ang_vel(data_dict["root_orient"], data_dict["fps"])
@@ -326,6 +349,13 @@ o be adjusted (T, 3)
         # print("project_gravity is: ", project_gravity)
         data_dict["project_gravity"] = project_gravity
         return data_dict
+    
+    def add_extra_data_from_poses_simple(self, data_dict): # this implies the quaternion is already smoothed
+        data_dict["root_orient"], data_dict["root_quat"] = self.get_root_orient(data_dict["root_quat"])
+        project_gravity = self.get_projected_gravity(data_dict["root_orient"]) # (T, 3)
+        data_dict["project_gravity"] = project_gravity
+        return data_dict
+        
 
     def calc_actions_vel(self, data_dict):
         actions = data_dict["actions"]
@@ -358,11 +388,11 @@ class AMASSActionConverter:
         self.load_hands = cfg.load_hands
         self.fk = RobotKinematics(cfg.urdf_path, device=cfg.device)
         self.model = PoseTransformer(num_actions=self.fk.num_dofs, load_hands=cfg.load_hands).to(cfg.device)
-        self.model.load_state_dict(torch.load(cfg.pose_transformer_path, map_location=torch.device(cfg.device),weights_only=False))
+        self.model.load_state_dict(torch.load(cfg.pose_transformer_path, map_location=torch.device(cfg.device), weights_only=False))
         jit_compile = kwargs.get("jit_compile", False)
         if jit_compile:
             self.model = torch.jit.trace(self.model, torch.zeros((1, 63 if not cfg.load_hands else 153), device=cfg.device))
-        self.model.eval() # set model to evaluation mode to improve performance
+        self.model.eval()
         self.post_process = TrackingDataPostProcess(filter_cfg=cfg.filter).to(cfg.device)
         self.batch_size = cfg.batch_size
         self.device = cfg.device
@@ -386,6 +416,49 @@ class AMASSActionConverter:
     @classmethod
     def from_cfg(cls, cfg: BaseCfg):
         return cls(cfg)
+    
+    @torch.no_grad()
+    def test_pose_to_action_fps(self):
+        print("Testing pose to action conversion performances on device: ", self.device)
+        t_begin = time.time()
+        # conducting batch_size = 1 retargeting test
+        pose = torch.randn(1, 63).to(self.device)
+        for i in range(500):
+            action = self.pose_to_action(pose)
+        t_end = time.time()
+        t_total = t_end - t_begin
+        t_avg = t_total / 500
+        fps = 1 / t_avg
+        print(f"Average time per pose to action conversion: {t_avg:.6f} seconds, FPS: {fps:.2f}")
+        
+        # conducting test with torch.jit.trace
+        traced_model = torch.jit.trace(self.model, torch.randn(1, 63).to(self.device))
+        traced_model.eval()
+        pose = torch.randn(1, 63).to(self.device)
+        t_begin = time.time()
+        for i in range(500):
+            action = traced_model(pose)
+            
+        t_end = time.time()
+        t_total = t_end - t_begin
+        t_avg = t_total / 500
+        fps = 1 / t_avg
+        print(f"Average time per pose to action conversion (jit): {t_avg:.6f} seconds, FPS: {fps:.2f}")
+            
+        # conducting multiple batch retargeting (batch size = 64)
+        t_begin = time.time()
+        pose = torch.randn(64, 63).to(self.device)
+        for i in range(50):
+            action = self.pose_to_action(pose)
+        t_end = time.time()
+        t_total = t_end - t_begin
+        t_avg = t_total / 50
+        fps = 1 / t_avg
+        t_avg_per_action = t_avg / 64
+        fps_per_action = 1 / t_avg_per_action
+        print(f"Average time per pose to action conversion (batch size = 64): {t_avg:.6f} seconds, FPS: {fps:.2f}")
+        print(f"Average time per action conversion: {t_avg_per_action:.6f} seconds, FPS per action: {fps_per_action:.2f}")
+
     @torch.no_grad()
     def pose_to_action(self, pose: torch.Tensor):
         '''
@@ -599,6 +672,124 @@ class AMASSActionConverter:
         plt.savefig(save_path)
         plt.close()
 
+    def adjust_root_height_and_translation(self, 
+                                           root_trans: torch.Tensor, 
+                                           root_orient: torch.Tensor,
+                                           actions: torch.Tensor,
+                                           foot_names: list[str],
+                                           feet_contact: torch.Tensor,
+                                           foot_ground_offset: float = 0.0,
+                                           penetration_tolerance: float = 0.005,
+                                           floating_tolerance: float = 0.05,
+                                           skating_threshold: float = 0.02):
+        """
+        Adjust root height based on penetration/floating metrics and adjust x,y based on skating.
+        
+        Args:
+            root_trans: Root translation (T, 3)
+            root_orient: Root orientation as rotation vector (T, 3)
+            actions: Robot joint actions (T, num_dofs)
+            foot_names: List of foot link names
+            feet_contact: Contact information (T, num_feet)
+            foot_ground_offset: Offset between foot link center and actual ground contact point (m)
+            penetration_tolerance: Tolerance for penetration ratio (default 0.005)
+            floating_tolerance: Tolerance for floating ratio (default 0.05)
+            skating_threshold: Threshold for detecting skating (m) (default 0.02)
+            
+        Returns:
+            Adjusted root_trans (T, 3)
+        """
+        # Get foot positions using FK
+        self.fk.set_target_links(foot_names)
+        foot_positions = self.fk.forward(actions, root_trans_offset=root_trans, root_rot=root_orient)  # (T, num_feet, 3)
+        
+        # Adjust for foot ground offset - the actual contact point is lower than the link center
+        # So we subtract the offset from the z coordinate to get the actual ground contact height
+        foot_contact_heights = foot_positions[:, :, 2] - foot_ground_offset  # (T, num_feet)
+        
+        # Calculate minimum height across all feet for each frame
+        min_heights = foot_contact_heights.min(dim=1)[0]  # (T,)
+        
+        # Calculate penetration and floating ratios
+        penetration_frames = (min_heights < 0).sum().item()
+        floating_frames = (min_heights > 0).sum().item()
+        total_frames = min_heights.shape[0]
+        
+        penetration_ratio = penetration_frames / total_frames
+        floating_ratio = floating_frames / total_frames
+        
+        # Adjust height based on penetration/floating
+        height_adjustment = 0.0
+        
+        if penetration_ratio > penetration_tolerance:
+            # Too much penetration, lift the character up
+            # Find the most severe penetration
+            max_penetration = -min_heights.min().item()
+            height_adjustment = max_penetration * 0.95  # Add 5% margin
+            print(f"Penetration ratio: {penetration_ratio:.3f} (>{penetration_tolerance}), lifting by {height_adjustment:.4f}m")
+        elif floating_ratio > floating_tolerance:
+            # Too much floating, lower the character down
+            # Find the minimum clearance during contact
+            contact_mask = feet_contact.sum(dim=1) > 0  # (T,) - frames with at least one foot in contact
+            if contact_mask.any():
+                min_contact_height = min_heights[contact_mask].min().item()
+                if min_contact_height > 0:
+                    height_adjustment = -min_contact_height * 0.95  # Lower by 95% of clearance
+                    print(f"Floating ratio: {floating_ratio:.3f} (>{floating_tolerance}), lowering by {-height_adjustment:.4f}m")
+        
+        # Apply height adjustment
+        root_trans = root_trans.clone()
+        root_trans[:, 2] += height_adjustment
+        
+        # Calculate skating and adjust x,y coordinates
+        # Recalculate foot positions after height adjustment
+        foot_positions = self.fk.forward(actions, root_trans_offset=root_trans, root_rot=root_orient)  # (T, num_feet, 3)
+        
+        # Calculate foot velocities
+        foot_velocities = torch.diff(foot_positions, dim=0) * self.dataset.interpolate_fps  # (T-1, num_feet, 3)
+        foot_velocities = torch.cat([torch.zeros_like(foot_positions[0:1]), foot_velocities], dim=0)  # (T, num_feet, 3)
+        
+        # Detect skating: contact feet moving too fast in xy plane
+        xy_speeds = torch.norm(foot_velocities[:, :, :2], dim=2)  # (T, num_feet)
+        
+        # For each foot, check if it's in contact but moving
+        skating_frames = torch.zeros(total_frames, dtype=torch.bool, device=root_trans.device)
+        for i in range(feet_contact.shape[1]):
+            # Frames where this foot is in contact but moving fast
+            skating = (feet_contact[:, i] > 0.5) & (xy_speeds[:, i] > skating_threshold)
+            skating_frames |= skating
+        
+        skating_ratio = skating_frames.sum().item() / total_frames
+        
+        if skating_ratio > 0.1:  # If more than 10% frames have skating
+            print(f"Skating detected in {skating_ratio:.1%} of frames, adjusting xy scale...")
+            
+            # Calculate expected vs actual travel distance
+            # Use contact phases to segment the motion
+            contact_changes = torch.diff(feet_contact.sum(dim=1) > 0, prepend=feet_contact[0:1].sum(dim=1) > 0)
+            
+            # Calculate actual root xy displacement
+            actual_displacement = torch.norm(root_trans[-1, :2] - root_trans[0, :2]).item()
+            
+            # Estimate expected displacement by integrating velocity during non-contact phases
+            # For contact phases, feet should be stationary, so we scale root motion
+            non_contact_mask = ~(feet_contact.sum(dim=1) > 0.5)
+            
+            if non_contact_mask.sum() > 0:
+                # Calculate scale factor based on skating magnitude
+                # More skating = more aggressive scaling
+                max_skating_speed = xy_speeds[skating_frames].max().item() if skating_frames.any() else 0
+                # scale_factor = 1.0 - min(0.3, skating_ratio * 0.5)  # Scale down by up to 30%
+                scale_factor = 1.0
+                
+                print(f"Applying xy scale factor: {scale_factor:.3f}")
+                
+                # Scale xy coordinates around the starting position
+                start_xy = root_trans[0, :2].clone()
+                root_trans[:, :2] = start_xy + (root_trans[:, :2] - start_xy) * scale_factor
+        
+        return root_trans
+
     def flip_pose_actions_left_right(self, data_dict):
         assert self.action_flip_left_right is not None, "Action flip left right is not set. Please set it using set_flipper method."
         # Create a deepcopy
@@ -652,7 +843,7 @@ class AMASSActionConverter:
                 # ensure trans & root_orient has same shape[0] as poses
                 trans = adjust_shape_0(trans, poses.shape[0])
                 root_orient = adjust_shape_0(root_orient, poses.shape[0])
-                trans = self.adjust_trans_height(trans, poses)
+                # trans = self.adjust_trans_height(trans, poses)
 
                 pose = poses[:, 3:66].to(self.device) if not self.load_hands else poses[:, 3:].to(self.device)
                 actions = self.pose_to_action(pose)
@@ -703,10 +894,23 @@ class AMASSActionConverter:
                 )
                 
                 filtered_root_poses = self.post_process.filt(filtered_root_poses.squeeze(0))
-
-                save_dict["trans"] = filtered_root_poses.squeeze(0)
                 
                 feet_contact_indices = feet_contact_indices.squeeze(0)
+                
+                # Adjust root height based on penetration/floating and xy based on skating
+                filtered_root_poses = self.adjust_root_height_and_translation(
+                    root_trans=filtered_root_poses,
+                    root_orient=root_orient,
+                    actions=actions_filtered,
+                    foot_names=foot_names,
+                    feet_contact=feet_contact_indices,
+                    foot_ground_offset=foot_ground_offset,
+                    penetration_tolerance=0.005,
+                    floating_tolerance=0.05,
+                    skating_threshold=0.02
+                )
+
+                save_dict["trans"] = filtered_root_poses
                 save_dict["feet_contact"] = feet_contact_indices
                 
 
@@ -799,3 +1003,93 @@ class AMASSActionConverter:
                 print(f"Error processing {fname}: {e}")
                 continue
         print(f"Converted {len(dataloader)} samples to {self.export_path}")
+
+
+if __name__ == "__main__":
+    mapping_table = {
+        'Pelvis': 'pelvis',
+        'L_Hip': 'left_hip_yaw_link',
+        'R_Hip': 'right_hip_yaw_link',
+        'L_Knee': 'left_knee_link',
+        'R_Knee': 'right_knee_link',
+        'L_Ankle': 'left_ankle_pitch_link',
+        'R_Ankle': 'right_ankle_pitch_link',
+        # 'L_Toe': 'left_ankle_roll_link',
+        # 'R_Toe': 'right_ankle_roll_link',
+        'L_Shoulder': 'left_shoulder_pitch_link',
+        'R_Shoulder': 'right_shoulder_pitch_link',
+        'L_Elbow': 'left_elbow_link',
+        'R_Elbow': 'right_elbow_link',
+        'L_Wrist': 'left_wrist_pitch_link',
+        'R_Wrist': 'right_wrist_pitch_link',
+        # 'Head': 'Link_head_yaw'
+    }
+    cfg = AMASSActionConverterCfg(
+        urdf_path = DATA_PATHS.urdf_path,
+        pose_transformer_path=DATA_PATHS.pose_transformer_path, 
+        export_path=DATA_PATHS.converted_actions_path,
+        mapping_table=mapping_table,
+        smplh_model_path=DATA_PATHS.smplh_model_path,
+        dmpls_model_path=DATA_PATHS.dmpls_model_path,
+        smpl_fits_dir=DATA_PATHS.smplh_fit_result_path,
+        device="cuda",
+        )
+    
+
+    # cfg.specialize_dir = ["KIT/3"]
+    joint_mapping_table = {
+        # "L_Ankle": {
+        #     "pitch": "left_ankle_pitch_joint",
+        #     "roll": "left_ankle_roll_joint",
+        # },
+        # "R_Ankle": {
+        #     "pitch": "right_ankle_pitch_joint",
+        #     "roll": "right_ankle_roll_joint",
+        # },
+        # "L_Hip": {
+        #     "roll": "left_hip_roll_joint",
+        #     "pitch": "left_hip_pitch_joint",
+        #     "yaw": "left_hip_yaw_joint",
+        # },
+        # "R_Hip": {
+        #     "roll": "right_hip_roll_joint",
+        #     "pitch": "right_hip_pitch_joint",
+        #     "yaw": "right_hip_yaw_joint",
+        # },
+        # "L_Shoulder": {
+        #     "yaw": "left_shoulder_yaw_joint",
+        # },
+        # "R_Shoulder": {
+        #     "yaw": "right_shoulder_yaw_joint",
+        # },
+        # "L_Elbow": {
+        #     "pitch": "left_elbow_joint",
+        # },
+        # "R_Elbow": {
+        #     "pitch": "right_elbow_joint",
+        # },
+    }
+    from GBC.utils.data_preparation.robot_flip_left_right import UnitreeH12FlipLeftRight
+    
+    flipper = UnitreeH12FlipLeftRight(cfg)
+
+    
+    converter = AMASSActionConverter.from_cfg(cfg)
+    converter.visualize = False
+    converter.set_flipper(flipper)
+    # converter.set_direct_joint_map_body(joint_mapping_table)
+    converter.convert(
+        foot_names=["left_ankle_pitch_link", "right_ankle_pitch_link"],
+        foot_ground_offset=0.045,
+        # data_correction_path=DATA_PATHS.extra_accad_path,
+        # data_correction_keys={
+        #     'trans': 'root_pos',
+        #     'root_orient': 'root_rot',
+        #     # 'feet_contact': 'feet_contact_time',
+        # },
+        add_flipped_data=True,
+        floor_contact_offset_map={
+            "left_ankle_roll_link": [0, 0, -0.045],
+            "right_ankle_roll_link": [0, 0, -0.045],
+        }
+    )

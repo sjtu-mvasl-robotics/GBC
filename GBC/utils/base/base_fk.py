@@ -12,9 +12,15 @@ import torch.nn.functional as F
 from torch import einsum, matmul
 from typing import Optional, List
 from GBC.utils.base.math_utils import euler_xyz_to_rot_mat
+import warnings
 
-
+try:
+    import mink # use MINK for more accurate ik
+    warnings.warn("Using `MINK` library for IK computation requires providing specified `MINK` configurations and valid MJCF(XML) files. Adding MINK to pre-compute the IK would significantly increase the time and memory capacity. We recommend users who have only single URDF file to try to implement better mapping table rather than relying on MINK.")
     
+except ImportError:
+    mink = None
+
 class RobotKinematics(nn.Module):
     def __init__(self, urdf_path: str, device: str = 'cpu'):
         """
@@ -44,6 +50,32 @@ class RobotKinematics(nn.Module):
         self.num_dofs = len(self.dof_names)
         self.target_links = None  # To be set via set_target_links
         # self.apply_joint_limits = apply_joint_limits
+        
+        self.mink_setup = {}
+        
+    def setup_mink(self, config_path):
+        """Setup MINK configurations.
+
+        Args:
+            config_path (str): Path to the MINK configuration file.
+            
+            To setup proper configuration file for MINK, please refer to https://github.com/kevinzakka/mink/blob/main/examples
+        """
+        if mink is None:
+            raise ImportError("MINK library is not installed. Please install it to use MINK functionalities.")
+        
+        import yaml
+        import mujoco
+        with open(config_path, 'r') as f:
+            mink_config = yaml.safe_load(f)
+        
+        xml_path = mink_config.get('mjcf_path', None)
+        if xml_path is None:
+            raise ValueError("MINK configuration file must specify 'mjcf_path'.")
+
+        self.mink_setup["robot"] = mujoco.MjModel.from_xml_path(xml_path)
+        self.mink_setup["configuration"] = mink.Configuration(self.mink_setup["robot"])
+        
 
     def to(self, device):
         self.device = torch.device(device)
@@ -356,7 +388,7 @@ class RobotKinematics(nn.Module):
         if dof_pos.dim() != 2:
             raise ValueError("dof_pos must be a 2D tensor.")
         if dof_pos.shape[1] != self.num_dofs:
-            raise ValueError(f"dof_pos must have {self.num_dofs} columns.")
+            raise ValueError(f"dof_pos must have {self.num_dofs} columns. Current dof_pos shape: {dof_pos.shape}")
         
         if root_trans_offset is not None:
             root_T = torch.eye(4, dtype=torch.float32, device=self.device).unsqueeze(0).repeat(dof_pos.shape[0], 1, 1)  # (B, 4, 4)
@@ -603,3 +635,16 @@ class RobotKinematics(nn.Module):
 
         plt.close(fig)
 
+
+
+if __name__ == "__main__":
+    fk = RobotKinematics(urdf_path="/home/yyf/codespace/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf", device='cuda')
+    dof_pos = torch.rand(1, fk.num_dofs) * 0.1
+    dof_pos.requires_grad = True
+    dof_pos = dof_pos.to(fk.device)
+    fk.set_target_links(["Link_ankle_l_pitch", "Link_ankle_r_pitch"])
+    fk.forward(dof_pos)
+    # test backward
+    loss = dof_pos.sum()
+    print("loss:", loss)
+    loss.backward()

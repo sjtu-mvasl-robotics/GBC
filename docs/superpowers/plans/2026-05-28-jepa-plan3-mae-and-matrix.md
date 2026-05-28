@@ -12,6 +12,12 @@
 
 ---
 
+## ADDENDUM (2026-05-28): locality config
+
+`pretrain_mfme.py` constructs `MorphologyFreeMotionEncoder(d_model=..., z_dim=...)`, which after Plan 1 Task 0 defaults to `graph_layers=1`, `per_slot_temporal=True`, `root_global_hub=False` — so both the `jepa` and `mae` pretrained encoders are locality-respecting, and the matrix's frozen-MFME rows freeze a locality-respecting encoder. **Do not override `graph_layers`.** `MaeReconModule`, the Level-1 probe, and the val evaluator all reuse the same encoder/`MotionLatentRetargeter` defaults. No code change to this plan's bodies is needed beyond inheriting the Task 0 defaults.
+
+---
+
 ## Reused interfaces (verified in Plans 1–2)
 
 - `MorphologyFreeMotionEncoder(d_model, z_dim, slot_latent_dim, ...)` with `forward(pose_aa, root_pose, beta, part_mask, sample, slot_time_mask)`; `.z_dim`, `.num_human_joints` (`=21`), `.root_dim` (`=9`) set in `__init__` (`morphology_conditioned_retargeter.py:351-353`).

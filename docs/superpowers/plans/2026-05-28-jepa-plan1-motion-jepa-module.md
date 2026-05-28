@@ -15,6 +15,20 @@
 
 ---
 
+## ADDENDUM (2026-05-28): align MFME with the landed locality fix
+
+The structured-path locality-leak fix has landed in `graph_retarget_latent.py` (memory: `project-latent-locality-fix`, `feedback-graph-layers-one-for-locality`). `GraphTemporalEncoder` now takes `per_slot_temporal: bool=False` and `root_global_hub: bool=True` (both default to **legacy/leaky**); MFME's call sites are unchanged, so MFME is not broken — but by default it produces a cross-region-leaky `graph_hidden`, which is exactly the JEPA target. To keep the JEPA latent locality-respecting, MFME must opt in:
+
+- `graph_layers = 1` (≥2 reintroduces a 2-hop cross-region leak via the joint-tree tokenizer + slot trunk)
+- `per_slot_temporal = True` (temporal attention within each slot, not across the full T×S grid)
+- `root_global_hub = False` (tree slot edges; `global_root` is not a star hub)
+
+**Task 0 below makes these the MFME / `MotionLatentRetargeter` defaults.** After Task 0, all constructions in Plans 1–3 inherit them; wherever a plan body shows `graph_layers=2`, it is superseded by `=1`. The unit-test MFMEs in this plan already pass `graph_layers=1`. **In Task 7 `run_smoke`, delete `graph_layers=2` from both `MorphologyFreeMotionEncoder(...)` calls** so they inherit the locality default (keep `temporal_layers=2`, `num_heads=8`).
+
+**Out of scope (open; user still deciding — do NOT implement):** per-slot VAE bottleneck for MFME (`z_slots` / derived `z_dim`) and an independent pure-pelvis root slot. Locality is enforced at the encoder/`graph_hidden` level (the JEPA target); MFME keeps its pooled `z` for CMAD/MAE/probes.
+
+---
+
 ## File Structure
 
 | File | Responsibility |
@@ -31,6 +45,109 @@
 - `DEFAULT_BODY_SLOTS` = `(global_root, trunk_head, left_arm, right_arm, left_leg, right_leg)`, so `S=6`, slot 0 is `global_root` (`graph_retarget_latent.py:14`).
 - Synthetic-motion helper pattern (mirror in tests/smoke): `pose (B,T,21,3)`, `root (B,T,9)`, `beta (B,16)` (`scripts/data_preparation/run_morph_latent_experiments.py:184-189`).
 - `MotionLatentRetargeter().mfme` is a `MorphologyFreeMotionEncoder` (`morphology_conditioned_retargeter.py:744`).
+
+---
+
+## Task 0: Make MFME locality-aware (foundation edit)
+
+**Files:**
+- Modify: `GBC/utils/data_preparation/morphology_conditioned_retargeter.py` (`MorphologyFreeMotionEncoder.__init__`, `MotionLatentRetargeter.__init__`)
+- Test: `tests/test_motion_jepa.py`
+
+- [ ] **Step 1: Write the failing test** (prepend to `tests/test_motion_jepa.py`, after the imports/`_synth` helper)
+
+```python
+class TestLocalityDefaults(unittest.TestCase):
+    def test_mfme_locality_config(self):
+        from GBC.utils.data_preparation.morphology_conditioned_retargeter import (
+            MotionLatentRetargeter,
+        )
+        mfme = MorphologyFreeMotionEncoder(d_model=64, z_dim=64, slot_latent_dim=16, num_heads=4)
+        self.assertTrue(mfme.encoder.per_slot_temporal)
+        self.assertEqual(len(mfme.encoder.graph_blocks), 1)            # graph_layers default = 1
+        self.assertFalse(mfme.encoder.graph_blocks[0].root_global_hub)  # tree slot edges
+        rt = MotionLatentRetargeter(d_model=64, z_dim=64, slot_latent_dim=16,
+                                    encoder_num_heads=4, morphology_num_heads=4, decoder_num_heads=4)
+        self.assertTrue(rt.mfme.encoder.per_slot_temporal)
+        self.assertEqual(len(rt.mfme.encoder.graph_blocks), 1)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cd /cpfs/user/yaoyifei/codespace/gbc/GBC && PYTHONPATH=. python -m pytest tests/test_motion_jepa.py::TestLocalityDefaults -v`
+Expected: FAIL — `per_slot_temporal` is `False` and there are 2 graph blocks (legacy defaults).
+
+- [ ] **Step 3: Edit `MorphologyFreeMotionEncoder.__init__`**
+
+Change the `graph_layers` default and add two flags to the signature:
+
+```python
+        graph_layers: int = 1,            # was 2 — graph_layers>=2 reintroduces 2-hop leak
+        temporal_layers: int = 4,
+        num_heads: int = 8,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
+        slot_joints: Optional[Dict[str, Sequence[int]]] = None,
+        tokenizer: str = "structured",
+        dropout: float = 0.1,
+        per_slot_temporal: bool = True,   # locality: temporal attn within each slot
+        root_global_hub: bool = False,    # locality: tree slot edges (root not a hub)
+```
+
+And pass both flags to the encoder construction:
+
+```python
+        self.encoder = GraphTemporalEncoder(
+            d_model=d_model,
+            num_heads=num_heads,
+            slots=self.slots,
+            edges=edges,
+            graph_layers=graph_layers,
+            temporal_layers=temporal_layers,
+            dropout=dropout,
+            per_slot_temporal=per_slot_temporal,
+            root_global_hub=root_global_hub,
+        )
+```
+
+- [ ] **Step 4: Edit `MotionLatentRetargeter.__init__`**
+
+Change `encoder_graph_layers` default and add two flags:
+
+```python
+        encoder_graph_layers: int = 1,    # was 2
+        encoder_temporal_layers: int = 4,
+        encoder_num_heads: int = 8,
+        ...
+        encoder_per_slot_temporal: bool = True,
+        encoder_root_global_hub: bool = False,
+```
+
+And thread them into the `self.mfme = MorphologyFreeMotionEncoder(...)` construction:
+
+```python
+            graph_layers=encoder_graph_layers,
+            ...
+            per_slot_temporal=encoder_per_slot_temporal,
+            root_global_hub=encoder_root_global_hub,
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `PYTHONPATH=. python -m pytest tests/test_motion_jepa.py::TestLocalityDefaults -v`
+Expected: PASS.
+
+- [ ] **Step 6: Foundation regression**
+
+Run: `PYTHONPATH=. python -m pytest tests/test_morphology_conditioned_retargeter.py -q`
+Expected: PASS. The structural tests forward/check gradients and tolerate `graph_layers=1`. If one asserts a layer-count or exact-value, investigate per systematic-debugging — do NOT revert the locality default to satisfy a stale assertion.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add GBC/utils/data_preparation/morphology_conditioned_retargeter.py tests/test_motion_jepa.py
+git commit -m "feat(jepa): MFME locality config (graph_layers=1, per_slot_temporal, tree edges)"
+```
 
 ---
 

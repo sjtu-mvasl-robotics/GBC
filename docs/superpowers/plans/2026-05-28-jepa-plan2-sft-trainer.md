@@ -12,6 +12,12 @@
 
 ---
 
+## ADDENDUM (2026-05-28): locality config
+
+Plan 1 Task 0 makes `MotionLatentRetargeter` default to `encoder_graph_layers=1`, `encoder_per_slot_temporal=True`, `encoder_root_global_hub=False` (the landed locality fix; memory `project-latent-locality-fix`). The SFT trainer here constructs `MotionLatentRetargeter(d_model=..., z_dim=...)` with those defaults — **correct as written; do not add `encoder_graph_layers=2`.** Checkpoints saved/loaded by this trainer therefore carry the locality-respecting encoder. Plan 1 must land before this plan runs. The FK-frame verification (Task 7 Step 2) is independent of this config.
+
+---
+
 ## Verified interface facts (from a code audit — do not re-derive)
 
 **Reused data pipeline (all in `GBC_MUJICA/GBC_MUJICA/data_preparation/gbc_retargeting/`):**

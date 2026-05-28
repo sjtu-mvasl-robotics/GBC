@@ -129,10 +129,11 @@ class SlotTemporalCell(nn.Module):
         dilation: int,
         right_taps: int,
         dropout: float = 0.1,
+        root_global_hub: bool = True,
     ):
         super().__init__()
         GraphFuseBlock = _get_graph_fuse_block_cls()
-        self.graph = GraphFuseBlock(d_model, num_heads, slots, edges, dropout)
+        self.graph = GraphFuseBlock(d_model, num_heads, slots, edges, dropout, root_global_hub=root_global_hub)
         self.conv = CausalConv1DBlock(
             d_model=d_model,
             kernel_size=kernel_size,
@@ -174,6 +175,7 @@ class CausalConvTemporalEncoder(nn.Module):
         dilations: Tuple[int, ...] = (1, 2, 4, 8),
         total_lookahead_frames: int = 0,
         dropout: float = 0.1,
+        root_global_hub: bool = True,
     ):
         super().__init__()
         if num_layers < 1:
@@ -206,6 +208,7 @@ class CausalConvTemporalEncoder(nn.Module):
                 dilation=self.dilations[i],
                 right_taps=right_taps_per_layer[i],
                 dropout=dropout,
+                root_global_hub=root_global_hub,
             )
             for i in range(num_layers)
         )

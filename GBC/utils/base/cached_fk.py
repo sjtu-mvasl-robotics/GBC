@@ -156,11 +156,19 @@ class CachedTargetLinkKinematics(nn.Module):
                 queue.append((child, path + [child]))
         raise ValueError(f"No path from {self.base_link} to {target_link}")
 
-    def get_dof_edges(self) -> tuple[tuple[int, int], ...]:
-        return self.dof_edges
+    def get_dof_edges(self, include_root_edges: bool = True) -> tuple[tuple[int, int], ...]:
+        # Cached `self.dof_edges` is the include_root_edges=True graph (root
+        # clique). When root edges are off, recompute the chain-only graph from
+        # the live reference kinematics (cheap, called once at model build).
+        if include_root_edges:
+            return self.dof_edges
+        return tuple(self.reference.get_dof_edges(include_root_edges=False))
 
-    def get_dof_edge_names(self) -> tuple[tuple[str, str], ...]:
-        return tuple((self.dof_names[i], self.dof_names[j]) for i, j in self.dof_edges)
+    def get_dof_edge_names(self, include_root_edges: bool = True) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (self.dof_names[i], self.dof_names[j])
+            for i, j in self.get_dof_edges(include_root_edges=include_root_edges)
+        )
 
     def get_dof_feature_names(self) -> tuple[str, ...]:
         return self.dof_feature_names

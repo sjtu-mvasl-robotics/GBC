@@ -82,6 +82,7 @@ def _edge_attention_mask(
     slots: Sequence[str],
     edges: Iterable[Tuple[str, str]],
     device: torch.device,
+    root_global_hub: bool = True,
 ) -> torch.Tensor:
     slot_to_idx = {name: i for i, name in enumerate(slots)}
     allowed = torch.eye(len(slots), dtype=torch.bool, device=device)
@@ -94,7 +95,14 @@ def _edge_attention_mask(
         allowed[i, j] = True
         allowed[j, i] = True
 
-    if "global_root" in slot_to_idx:
+    # root_global_hub=True (legacy/baseline): global_root attends to ALL slots,
+    # turning the slot graph into a star. That makes the root token aggregate
+    # arm+leg+trunk in one hop, which leaks unrelated regions into each other
+    # through root (arm -> root -> leg). root_global_hub=False (structured
+    # locality fix, plan A0) keeps ONLY the provided tree edges, so a leaf slot's
+    # receptive field stays {itself, its tree neighbours} and cross-region
+    # coupling needs multiple hops.
+    if root_global_hub and "global_root" in slot_to_idx:
         root_idx = slot_to_idx["global_root"]
         allowed[root_idx, :] = True
         allowed[:, root_idx] = True
@@ -198,7 +206,7 @@ class HumanSlotTokenizer(nn.Module):
         self.slot_joints: Dict[str, Tuple[int, ...]] = {}
         self.slot_mlps = nn.ModuleDict()
         for slot in self.slots:
-            if slot == "global_root":
+            if slot in ("global_root", "root_state"):
                 input_dim = root_dim
                 self.slot_joints[slot] = tuple()
             else:
@@ -233,7 +241,7 @@ class HumanSlotTokenizer(nn.Module):
         batch_size, window, _, _ = pose_aa.shape
         tokens = []
         for slot in self.slots:
-            if slot == "global_root":
+            if slot in ("global_root", "root_state"):
                 feature = root_pose
             else:
                 joints = self.slot_joints[slot]
@@ -301,8 +309,16 @@ class SkeletalJointTokenizer(nn.Module):
         slot_ids = _slot_index_for_joints(self.slots, self.slot_joints, self.num_human_joints)
         self.register_buffer("slot_ids", slot_ids, persistent=False)
 
-        self.pose_embed = nn.Sequential(
-            nn.Linear(3, d_model),
+        # Per-joint modalities (angle-axis + optional FK pos / vel / contact) are
+        # CONCATENATED along the feature axis and embedded once. Summing separate
+        # nonlinear per-modality embeds entangles channels — a learned mix of
+        # "3 rad pose, 0 vel" can collide with "0 pose, 3 rad/s vel" — so the
+        # encoder cannot tell which modality is which. Concat keeps them distinct.
+        self.joint_input_dim = (
+            3 + self.joint_geometry_dim + self.joint_velocity_dim + self.joint_contact_dim
+        )
+        self.joint_input_embed = nn.Sequential(
+            nn.Linear(self.joint_input_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
@@ -311,25 +327,20 @@ class SkeletalJointTokenizer(nn.Module):
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
+        # Independent "root_state" slot: a pelvis-only token built straight from
+        # root features, BYPASSING the joint-tree attention, so it never absorbs
+        # limb info. It is also isolated in the slot graph (no edges), so it stays
+        # a pure root-state latent that the decoder can share into every DoF
+        # without leaking one limb into another.
+        self.root_state_embed = nn.Sequential(
+            nn.Linear(root_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
         self.beta_embed = nn.Sequential(
             nn.Linear(beta_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
-        )
-        self.joint_pos_embed = (
-            nn.Sequential(nn.Linear(self.joint_geometry_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
-            if self.joint_geometry_dim > 0
-            else None
-        )
-        self.joint_vel_embed = (
-            nn.Sequential(nn.Linear(self.joint_velocity_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
-            if self.joint_velocity_dim > 0
-            else None
-        )
-        self.joint_contact_embed = (
-            nn.Sequential(nn.Linear(self.joint_contact_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
-            if self.joint_contact_dim > 0
-            else None
         )
         self.joint_embed = nn.Embedding(num_human_joints + 1, d_model)
         self.slot_embed = nn.Embedding(len(self.slots), d_model)
@@ -373,25 +384,39 @@ class SkeletalJointTokenizer(nn.Module):
             part_mask = part_mask.to(device=pose_aa.device, dtype=torch.bool)
 
         root_token = self.root_embed(root_pose).unsqueeze(2)
-        joint_tokens = self.pose_embed(pose_aa)
-        if joint_pos is not None and self.joint_pos_embed is not None:
-            if joint_pos.shape[:3] != pose_aa.shape[:3]:
-                raise ValueError(f"joint_pos shape must match pose_aa[:3]; got {tuple(joint_pos.shape)}")
-            if joint_pos.shape[-1] != self.joint_geometry_dim:
-                raise ValueError(f"joint_pos last dim must be {self.joint_geometry_dim}; got {joint_pos.shape[-1]}")
-            joint_tokens = joint_tokens + self.joint_pos_embed(joint_pos)
-        if joint_vel is not None and self.joint_vel_embed is not None:
-            if joint_vel.shape[:3] != pose_aa.shape[:3]:
-                raise ValueError(f"joint_vel shape must match pose_aa[:3]; got {tuple(joint_vel.shape)}")
-            if joint_vel.shape[-1] != self.joint_velocity_dim:
-                raise ValueError(f"joint_vel last dim must be {self.joint_velocity_dim}; got {joint_vel.shape[-1]}")
-            joint_tokens = joint_tokens + self.joint_vel_embed(joint_vel)
-        if joint_contact is not None and self.joint_contact_embed is not None:
-            if joint_contact.shape[:3] != pose_aa.shape[:3]:
-                raise ValueError(f"joint_contact shape must match pose_aa[:3]; got {tuple(joint_contact.shape)}")
-            if joint_contact.shape[-1] != self.joint_contact_dim:
-                raise ValueError(f"joint_contact last dim must be {self.joint_contact_dim}; got {joint_contact.shape[-1]}")
-            joint_tokens = joint_tokens + self.joint_contact_embed(joint_contact)
+        # Concatenate per-joint modalities along the feature axis. Any configured
+        # modality that is absent at call time is zero-filled so the input width
+        # stays fixed at self.joint_input_dim.
+        parts = [pose_aa]
+        if self.joint_geometry_dim > 0:
+            if joint_pos is not None:
+                if joint_pos.shape[:3] != pose_aa.shape[:3] or joint_pos.shape[-1] != self.joint_geometry_dim:
+                    raise ValueError(
+                        f"joint_pos must be (B,T,{num_joints},{self.joint_geometry_dim}); got {tuple(joint_pos.shape)}"
+                    )
+                parts.append(joint_pos)
+            else:
+                parts.append(pose_aa.new_zeros(batch_size, window, num_joints, self.joint_geometry_dim))
+        if self.joint_velocity_dim > 0:
+            if joint_vel is not None:
+                if joint_vel.shape[:3] != pose_aa.shape[:3] or joint_vel.shape[-1] != self.joint_velocity_dim:
+                    raise ValueError(
+                        f"joint_vel must be (B,T,{num_joints},{self.joint_velocity_dim}); got {tuple(joint_vel.shape)}"
+                    )
+                parts.append(joint_vel)
+            else:
+                parts.append(pose_aa.new_zeros(batch_size, window, num_joints, self.joint_velocity_dim))
+        if self.joint_contact_dim > 0:
+            if joint_contact is not None:
+                if joint_contact.shape[:3] != pose_aa.shape[:3] or joint_contact.shape[-1] != self.joint_contact_dim:
+                    raise ValueError(
+                        f"joint_contact must be (B,T,{num_joints},{self.joint_contact_dim}); got {tuple(joint_contact.shape)}"
+                    )
+                parts.append(joint_contact)
+            else:
+                parts.append(pose_aa.new_zeros(batch_size, window, num_joints, self.joint_contact_dim))
+        joint_input = torch.cat(parts, dim=-1)  # (B, T, num_joints, joint_input_dim)
+        joint_tokens = self.joint_input_embed(joint_input)
         tokens = torch.cat([root_token, joint_tokens], dim=2)
 
         token_count = self.num_human_joints + 1
@@ -418,6 +443,11 @@ class SkeletalJointTokenizer(nn.Module):
             if slot == "global_root":
                 slot_tokens.append(tokens[:, :, 0, :])
                 continue
+            if slot == "root_state":
+                # Pure pelvis token: built from root features only, NOT from the
+                # joint-tree-attended tokens (which carry limb info).
+                slot_tokens.append(self.root_state_embed(root_pose))
+                continue
             joints = self.slot_joints.get(slot, ())
             if joints:
                 token_indices = torch.tensor([j + 1 for j in joints], device=pose_aa.device, dtype=torch.long)
@@ -437,10 +467,12 @@ class GraphFuseBlock(nn.Module):
         slots: Sequence[str] = DEFAULT_BODY_SLOTS,
         edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
         dropout: float = 0.1,
+        root_global_hub: bool = True,
     ):
         super().__init__()
         self.slots = tuple(slots)
         self.edges = tuple(edges)
+        self.root_global_hub = bool(root_global_hub)
         self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -456,7 +488,7 @@ class GraphFuseBlock(nn.Module):
         batch_size, window, num_slots, d_model = x.shape
         flat = x.reshape(batch_size * window, num_slots, d_model)
         key_padding_mask = ~part_mask[:, None, :].expand(batch_size, window, num_slots).reshape(batch_size * window, num_slots)
-        attn_mask = _edge_attention_mask(self.slots, self.edges, x.device)
+        attn_mask = _edge_attention_mask(self.slots, self.edges, x.device, root_global_hub=self.root_global_hub)
 
         attn_out, _ = self.attn(flat, flat, flat, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
         flat = self.norm1(flat + attn_out)
@@ -465,7 +497,7 @@ class GraphFuseBlock(nn.Module):
 
 
 class GraphTemporalEncoder(nn.Module):
-    # Bidirectional transformer over (T * num_slots) tokens — acausal.
+    # Bidirectional transformer over the time axis — acausal.
     # These class-level attributes exist so the trainer's metric logging
     # (getattr(model.encoder, "is_causal", default)) reports the correct
     # value without falling back to a default.
@@ -481,12 +513,23 @@ class GraphTemporalEncoder(nn.Module):
         graph_layers: int = 2,
         temporal_layers: int = 2,
         dropout: float = 0.1,
+        per_slot_temporal: bool = False,
+        root_global_hub: bool = True,
     ):
         super().__init__()
         self.slots = tuple(slots)
+        # per_slot_temporal=False (default): legacy full (T*num_slots) bidirectional
+        # attention — preserved byte-for-byte for the baseline path and the
+        # standalone GraphRetargetVAE. per_slot_temporal=True (structured path):
+        # temporal attention runs WITHIN each slot, so cross-slot mixing happens
+        # only through the edge-masked GraphFuseBlock. Without this, the full
+        # T*num_slots attention blends e.g. leg@t' into arm@t, defeating the
+        # per-slot latent locality the structured decoder relies on (plan A0).
+        self.per_slot_temporal = bool(per_slot_temporal)
         self.slot_embed = nn.Parameter(torch.randn(1, 1, len(self.slots), d_model) * 0.02)
         self.graph_blocks = nn.ModuleList(
-            GraphFuseBlock(d_model, num_heads, self.slots, edges, dropout) for _ in range(graph_layers)
+            GraphFuseBlock(d_model, num_heads, self.slots, edges, dropout, root_global_hub=root_global_hub)
+            for _ in range(graph_layers)
         )
         temporal_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -507,6 +550,14 @@ class GraphTemporalEncoder(nn.Module):
 
         time_pos = _sinusoidal_position_encoding(window, d_model, x.device, x.dtype)
         x = x + time_pos.view(1, window, 1, d_model)
+        if self.per_slot_temporal:
+            # (B, T, S, D) -> (B*S, T, D): temporal attention is confined to each
+            # slot's own time series. Missing slots carry placeholder tokens; we do
+            # not mask them here (a fully-masked sequence would NaN the softmax) —
+            # cross-slot leakage is already blocked by running attention per slot.
+            flat = x.permute(0, 2, 1, 3).reshape(batch_size * num_slots, window, d_model)
+            flat = self.temporal_encoder(flat)
+            return flat.reshape(batch_size, num_slots, window, d_model).permute(0, 2, 1, 3).contiguous()
         flat = x.reshape(batch_size, window * num_slots, d_model)
         temporal_mask = ~part_mask[:, None, :].expand(batch_size, window, num_slots).reshape(batch_size, window * num_slots)
         flat = self.temporal_encoder(flat, src_key_padding_mask=temporal_mask)
@@ -629,17 +680,85 @@ class RobotActionAdapter(nn.Module):
         raise NotImplementedError
 
 
+def build_dof_slot_correspondence(
+    robot_dof_names: Sequence[str],
+    human_slots: Sequence[str],
+) -> Tuple[torch.Tensor, torch.Tensor, list]:
+    """Map each robot DoF to its kinematically-relevant human body slot(s).
+
+    Region by keyword on the (lower-cased) DoF name:
+        hip|knee|ankle      -> {left,right}_leg
+        shoulder|elbow|wrist-> {left,right}_arm
+        waist|torso|spine   -> trunk_head
+    Side is taken from a 'left'/'right' substring. Returns:
+        primary_slot[num_dof] (long)  — region slot; the routed-z gather indexes
+            this for EVERY DoF, so it is always defined (unknown -> global_root).
+        allowed_mask[num_dof, S] (bool) — slots a DoF may attend to:
+            {region_slot, global_root}; arms also add trunk_head. UNKNOWN DoFs
+            get all-True (safe) and primary_slot = global_root.
+        log — list of (dof_name, slot-or-tag) for run_config.
+    """
+    slot_to_idx = {name: i for i, name in enumerate(human_slots)}
+    num_slots = len(human_slots)
+    root_idx = slot_to_idx.get("global_root", 0)
+    # The shared root context/injection uses the pure 'root_state' slot when it
+    # exists (it carries no limb info), else falls back to 'global_root'.
+    shared_root = "root_state" if "root_state" in slot_to_idx else "global_root"
+    num_dof = len(robot_dof_names)
+
+    primary = torch.full((num_dof,), root_idx, dtype=torch.long)
+    allowed = torch.zeros((num_dof, num_slots), dtype=torch.bool)
+    log: list = []
+
+    for d, raw in enumerate(robot_dof_names):
+        name = str(raw).lower()
+        side = "left" if "left" in name else ("right" if "right" in name else None)
+        region: Optional[str] = None
+        allow_names: Tuple[str, ...] = ()
+        if any(k in name for k in ("hip", "knee", "ankle")) and side is not None:
+            region = f"{side}_leg"
+            allow_names = (region, shared_root)
+        elif any(k in name for k in ("shoulder", "elbow", "wrist")) and side is not None:
+            region = f"{side}_arm"
+            allow_names = (region, "trunk_head", shared_root)
+        elif any(k in name for k in ("waist", "torso", "spine")):
+            region = "trunk_head"
+            allow_names = (region, shared_root)
+
+        if region is not None and region in slot_to_idx:
+            primary[d] = slot_to_idx[region]
+            for s in allow_names:
+                if s in slot_to_idx:
+                    allowed[d, slot_to_idx[s]] = True
+            log.append((str(raw), region))
+        else:
+            # Unknown / side-less DoF: route to root, allow ALL slots (safe).
+            primary[d] = root_idx
+            allowed[d, :] = True
+            log.append((str(raw), "UNKNOWN->global_root(all-allowed)"))
+
+    return primary, allowed, log
+
+
 class RobotGraphActionDecoder(RobotActionAdapter):
-    """Decode per-frame latent through robot dof tokens and a robot graph."""
+    """Decode a PER-SLOT latent through robot dof tokens and a robot graph.
+
+    Each DoF token is seeded only from its region slot latent (+ the shared root
+    slot), never from a global broadcast, and its cross-attention to the encoder
+    context is masked to its allowed human slots. This keeps a robot DoF's output
+    dependent only on its kinematically-relevant human region (+ root), which is
+    the spatial-locality fix (plan B). Structured path only.
+    """
 
     def __init__(
         self,
-        z_dim: int,
+        slot_z: int,
         beta_dim: int,
         output_dim: int,
         d_model: int,
         num_heads: int,
         robot_dof_names: Optional[Sequence[str]] = None,
+        human_slots: Sequence[str] = DEFAULT_BODY_SLOTS,
         robot_dof_edges: Optional[Sequence[Tuple[int, int]]] = None,
         robot_dof_features: Optional[torch.Tensor] = None,
         robot_embedding_dim: int = 0,
@@ -647,14 +766,58 @@ class RobotGraphActionDecoder(RobotActionAdapter):
         graph_layers: int = 2,
         temporal_layers: int = 2,
         context_dim: Optional[int] = None,
+        decoder_context: str = "masked_graph_hidden",
+        root_slot_into_arms: bool = True,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.output_dim = int(output_dim)
         self.d_model = int(d_model)
+        self.slot_z = int(slot_z)
         self.robot_embedding_dim = int(robot_embedding_dim)
         self.robot_dof_names = tuple(robot_dof_names or ())
-        self.z_embed = nn.Sequential(nn.Linear(z_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.human_slots = tuple(human_slots)
+        if decoder_context not in {"masked_graph_hidden", "none"}:
+            raise ValueError(f"Unknown decoder_context: {decoder_context}")
+        self.decoder_context = str(decoder_context)
+        self.root_slot_into_arms = bool(root_slot_into_arms)
+        # Shared-root injection uses the pure 'root_state' slot when present (no
+        # limb info), else the kinematic 'global_root' hub.
+        if "root_state" in self.human_slots:
+            self.root_slot_idx = self.human_slots.index("root_state")
+        elif "global_root" in self.human_slots:
+            self.root_slot_idx = self.human_slots.index("global_root")
+        else:
+            self.root_slot_idx = 0
+
+        # DoF -> human-slot correspondence (routing + cross-attn mask).
+        names_for_corr = self.robot_dof_names or tuple(str(i) for i in range(self.output_dim))
+        primary_slot, allowed_mask, corr_log = build_dof_slot_correspondence(names_for_corr, self.human_slots)
+        self.dof_slot_correspondence_log = [list(item) for item in corr_log]
+        # Per-DoF gate for the shared root-slot contribution. Off for arm DoFs when
+        # root_slot_into_arms is False (strict arm isolation).
+        arm_idxs = {
+            self.human_slots.index(s)
+            for s in ("left_arm", "right_arm")
+            if s in self.human_slots
+        }
+        root_gate = torch.ones(self.output_dim, dtype=torch.float32)
+        if not self.root_slot_into_arms:
+            for d in range(self.output_dim):
+                if int(primary_slot[d].item()) in arm_idxs:
+                    root_gate[d] = 0.0
+                    # Consistency: if root is NOT injected into an arm DoF, the arm
+                    # must also not cross-attend to the root slot's context, which
+                    # carries leg info (root <-> legs in the slot tree). Otherwise
+                    # the masked-context path silently re-leaks leg -> arm.
+                    allowed_mask[d, self.root_slot_idx] = False
+        self.register_buffer("dof_primary_slot", primary_slot, persistent=False)        # (num_dof,)
+        self.register_buffer("dof_slot_attn_mask", ~allowed_mask, persistent=False)     # (num_dof, S) True=block
+        self.register_buffer("dof_root_gate", root_gate.view(1, 1, self.output_dim, 1), persistent=False)
+
+        # Routed-z injectors (replace the global z_embed broadcast).
+        self.z_slot_embed = nn.Sequential(nn.Linear(self.slot_z, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.root_slot_embed = nn.Sequential(nn.Linear(self.slot_z, d_model), nn.GELU(), nn.LayerNorm(d_model))
         self.beta_embed = nn.Sequential(nn.Linear(beta_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
         self.dof_embed = nn.Embedding(output_dim, d_model)
         if robot_dof_features is None:
@@ -709,7 +872,10 @@ class RobotGraphActionDecoder(RobotActionAdapter):
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        batch_size, window, _ = z.shape
+        # z is per-slot z_slots: (B, T, S, slot_z).
+        if z.ndim != 4:
+            raise ValueError(f"RobotGraphActionDecoder expects z_slots (B,T,S,slot_z); got {tuple(z.shape)}")
+        batch_size, window, num_slots, slot_z = z.shape
         if beta is None:
             beta = z.new_zeros(batch_size, self.beta_embed[0].in_features)
 
@@ -719,14 +885,25 @@ class RobotGraphActionDecoder(RobotActionAdapter):
             dof_features = self.robot_dof_features.to(device=z.device, dtype=self.dof_embed.weight.dtype)
             feature_token = self.robot_dof_feature_proj(dof_features).to(dtype=x.dtype)
             x = x + feature_token.view(1, 1, self.output_dim, self.d_model)
-        x = x + self.z_embed(z).unsqueeze(2) + self.beta_embed(beta).view(batch_size, 1, 1, self.d_model)
+        x = x.expand(batch_size, window, self.output_dim, self.d_model).contiguous()
+
+        # Routed z injection: each DoF token gets ONLY its region slot latent +
+        # the shared root slot latent (gated per DoF). No global broadcast.
+        primary = self.dof_primary_slot.to(device=z.device)
+        region = z.gather(
+            2, primary.view(1, 1, self.output_dim, 1).expand(batch_size, window, self.output_dim, slot_z)
+        )  # (B, T, num_dof, slot_z)
+        root = z[:, :, self.root_slot_idx, :]  # (B, T, slot_z)
+        x = x + self.z_slot_embed(region)
+        root_contrib = self.root_slot_embed(root).unsqueeze(2) * self.dof_root_gate.to(dtype=x.dtype)
+        x = x + root_contrib
+        x = x + self.beta_embed(beta).view(batch_size, 1, 1, self.d_model)
         if self.robot_embed is not None:
             if robot_id is None:
                 robot_id = torch.zeros(batch_size, dtype=torch.long, device=z.device)
             x = x + self.robot_embed(robot_id).view(batch_size, 1, 1, self.d_model)
-        x = x.expand(batch_size, window, self.output_dim, self.d_model)
 
-        if context is not None:
+        if self.decoder_context == "masked_graph_hidden" and context is not None:
             ctx = self.context_proj(context).reshape(batch_size * window, context.shape[2], self.d_model)
             flat = x.reshape(batch_size * window, self.output_dim, self.d_model)
             key_padding_mask = None
@@ -734,7 +911,9 @@ class RobotGraphActionDecoder(RobotActionAdapter):
                 key_padding_mask = ~context_mask[:, None, :].expand(batch_size, window, context.shape[2]).reshape(
                     batch_size * window, context.shape[2]
                 )
-            attn_out, _ = self.cross_attn(flat, ctx, ctx, key_padding_mask=key_padding_mask)
+            # Region mask: DoF d may only attend to its allowed human slots.
+            attn_mask = self.dof_slot_attn_mask.to(device=z.device)
+            attn_out, _ = self.cross_attn(flat, ctx, ctx, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             x = self.cross_norm(flat + attn_out).reshape(batch_size, window, self.output_dim, self.d_model)
 
         flat = x.reshape(batch_size * window, self.output_dim, self.d_model)
@@ -946,6 +1125,7 @@ class UnifiedLatentRetargeter(nn.Module):
         root_dim: int = 9,
         d_model: int = 256,
         z_dim: int = 256,
+        slot_z: int = 48,
         slot_latent_dim: int = 32,
         graph_layers: int = 2,
         temporal_layers: int = 4,
@@ -970,6 +1150,8 @@ class UnifiedLatentRetargeter(nn.Module):
         robot_dof_features: Optional[torch.Tensor] = None,
         decoder_graph_layers: int = 2,
         decoder_temporal_layers: int = 2,
+        decoder_context: str = "masked_graph_hidden",
+        decoder_root_slot_into_arms: bool = True,
         frame_chunk_size: int = 4096,
         joint_geometry_dim: int = 0,
         joint_velocity_dim: int = 0,
@@ -999,16 +1181,34 @@ class UnifiedLatentRetargeter(nn.Module):
         self.beta_dim = int(beta_dim)
         self.root_dim = int(root_dim)
         self.d_model = int(d_model)
-        self.z_dim = int(z_dim)
         self.slots = tuple(slots)
+        self.latent_architecture = str(latent_architecture)
+        if self.latent_architecture not in {"baseline", "structured"}:
+            raise ValueError(f"Unknown latent_architecture: {latent_architecture}")
+        # Structured path appends an INDEPENDENT 'root_state' slot: a pelvis-only
+        # latent that is isolated in the slot graph (no edges) and bypasses the
+        # joint-tree attention, so it carries pure root state with no limb info.
+        # The decoder shares this slot into every DoF, giving each DoF physical
+        # pelvis context with zero cross-limb leakage. The 'global_root' slot
+        # stays the kinematic-tree hub (limbs attach to it) and the unknown-DoF
+        # fallback. Baseline keeps the 6-slot default unchanged.
+        if self.latent_architecture == "structured" and "root_state" not in self.slots:
+            self.slots = self.slots + ("root_state",)
+        # Structured path uses a PER-SLOT latent: each body slot owns `slot_z`
+        # dims, and the global latent width is DERIVED as num_slots * slot_z
+        # (overriding any passed z_dim). Global consumers (human recon, residual,
+        # root-height, spectral, world, KL) see the flattened z_global of width
+        # self.z_dim; only the routed action decoder consumes the per-slot
+        # z_slots. The baseline path keeps the passed z_dim unchanged.
+        self.slot_z = int(slot_z)
+        if self.latent_architecture == "structured":
+            z_dim = len(self.slots) * self.slot_z
+        self.z_dim = int(z_dim)
         self.residual_scale = float(residual_scale)
         self.teacher_base_blend = float(teacher_base_blend)
         self.root_height_range = float(root_height_range)
-        self.latent_architecture = str(latent_architecture)
         self.frame_chunk_size = int(frame_chunk_size)
         self.register_buffer("ref_base_height", torch.tensor(float(ref_base_height), dtype=torch.float32))
-        if self.latent_architecture not in {"baseline", "structured"}:
-            raise ValueError(f"Unknown latent_architecture: {latent_architecture}")
 
         self.frame_model = PoseTransformer(
             load_hands=load_hands,
@@ -1044,6 +1244,11 @@ class UnifiedLatentRetargeter(nn.Module):
         encoder_temporal_layers = (
             temporal_layers if temporal_num_layers is None else int(temporal_num_layers)
         )
+        # Structured path drops the root-as-global-hub slot edge so the encoder's
+        # per-slot receptive field stays {itself, tree neighbours} — the second
+        # half of the A0 locality fix (the first is per_slot_temporal). Baseline
+        # keeps the legacy star graph (root attends to all slots) unchanged.
+        encoder_root_global_hub = self.latent_architecture != "structured"
         if self.temporal_module == "transformer":
             self.encoder = GraphTemporalEncoder(
                 d_model=d_model,
@@ -1053,6 +1258,10 @@ class UnifiedLatentRetargeter(nn.Module):
                 graph_layers=graph_layers,
                 temporal_layers=encoder_temporal_layers,
                 dropout=dropout,
+                # Structured path needs slot-local temporal mixing so the per-slot
+                # latent (and the masked decoder context) stay region-local.
+                per_slot_temporal=(self.latent_architecture == "structured"),
+                root_global_hub=encoder_root_global_hub,
             )
         elif self.temporal_module in {"causal_conv", "lookahead_conv"}:
             if self.temporal_module == "causal_conv" and int(temporal_lookahead_frames) != 0:
@@ -1070,6 +1279,7 @@ class UnifiedLatentRetargeter(nn.Module):
                 dilations=tuple(int(d) for d in temporal_dilations),
                 total_lookahead_frames=int(temporal_lookahead_frames),
                 dropout=dropout,
+                root_global_hub=encoder_root_global_hub,
             )
         else:
             raise ValueError(
@@ -1080,18 +1290,27 @@ class UnifiedLatentRetargeter(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, slot_latent_dim),
         )
-        self.mu_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
-        self.logvar_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+        if self.latent_architecture == "structured":
+            # Per-slot bottleneck: each slot token gets its own mu/logvar of
+            # width slot_z, read directly from graph_hidden (NO masked-mean pool).
+            # z_global = z_slots.reshape(B, T, num_slots * slot_z) is what global
+            # consumers see; the routed decoder consumes z_slots.
+            self.mu_head_slot = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.slot_z))
+            self.logvar_head_slot = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, self.slot_z))
+        else:
+            self.mu_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+            self.logvar_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
 
         decoder_hidden = max(d_model, z_dim)
         if self.latent_architecture == "structured":
             self.latent_action_decoder = RobotGraphActionDecoder(
-                z_dim=z_dim,
+                slot_z=self.slot_z,
                 beta_dim=beta_dim,
                 output_dim=num_actions,
                 d_model=decoder_hidden,
                 num_heads=num_heads,
                 robot_dof_names=robot_dof_names,
+                human_slots=self.slots,
                 robot_dof_edges=robot_dof_edges,
                 robot_dof_features=robot_dof_features,
                 robot_embedding_dim=robot_embedding_dim,
@@ -1099,6 +1318,8 @@ class UnifiedLatentRetargeter(nn.Module):
                 graph_layers=decoder_graph_layers,
                 temporal_layers=decoder_temporal_layers,
                 context_dim=d_model,
+                decoder_context=str(decoder_context),
+                root_slot_into_arms=bool(decoder_root_slot_into_arms),
                 dropout=dropout,
             )
         else:
@@ -1244,10 +1465,17 @@ class UnifiedLatentRetargeter(nn.Module):
         else:
             slot_tokens, part_mask = self.tokenizer(pose_aa, root_features, beta, part_mask)
         graph_hidden = self.encoder(slot_tokens, part_mask)
-        pooled = _masked_mean(graph_hidden, part_mask[:, None, :], dim=2)
+        if self.latent_architecture == "structured":
+            # Per-slot mu/logvar straight off graph_hidden: (B, T, S, slot_z).
+            mu = self.mu_head_slot(graph_hidden)
+            logvar = self.logvar_head_slot(graph_hidden)
+        else:
+            pooled = _masked_mean(graph_hidden, part_mask[:, None, :], dim=2)
+            mu = self.mu_head(pooled)
+            logvar = self.logvar_head(pooled)
         return {
-            "mu": self.mu_head(pooled),
-            "logvar": self.logvar_head(pooled),
+            "mu": mu,
+            "logvar": logvar,
             "slot_latents": self.slot_projector(graph_hidden),
             "graph_hidden": graph_hidden,
             "part_mask": part_mask,
@@ -1292,16 +1520,22 @@ class UnifiedLatentRetargeter(nn.Module):
         )
         if sample is None:
             sample = self.training
-        z = self.reparameterize(encoded["mu"], encoded["logvar"], sample=sample)
+        z_full = self.reparameterize(encoded["mu"], encoded["logvar"], sample=sample)
         if self.latent_architecture == "structured":
+            # z_full is per-slot (B, T, S, slot_z). The routed decoder consumes the
+            # per-slot tensor; everything else (and output["z"]) uses the flattened
+            # z_global (B, T, S*slot_z).
+            z_slots = z_full
+            z = z_full.reshape(batch_size, window, -1)
             latent_actions = self.latent_action_decoder(
-                z,
+                z_slots,
                 beta,
                 robot_id=robot_id,
                 context=encoded["graph_hidden"],
                 context_mask=encoded["part_mask"],
             )
         else:
+            z = z_full
             latent_actions = self.latent_action_decoder(z, beta, robot_id=robot_id)
         root_token = self.root_embed(root_features)
         blend = self.teacher_base_blend if base_blend is None else float(base_blend)

@@ -10,7 +10,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import einsum, matmul
-from typing import Optional, List
+from typing import Optional, List, Sequence, Tuple
 from GBC.utils.base.math_utils import euler_xyz_to_rot_mat
 import warnings
 
@@ -308,6 +308,183 @@ class RobotKinematics(nn.Module):
 
             self.dof_related_link_names = sorted_links
         return self.dof_related_link_names
+
+    def get_dof_edges(self, include_root_edges: bool = True):
+        """
+        Return an undirected DoF graph induced by the URDF kinematic tree.
+
+        Each movable joint is a graph node in `self.dof_names` order. Edges
+        connect a movable joint to its nearest movable descendants, skipping
+        fixed joints. Movable joints that attach to the base through no movable
+        ancestor are connected through an implicit base-root clique so branched
+        robots still expose pelvis/torso coupling to graph decoders.
+        """
+        if hasattr(self, "dof_edges") and include_root_edges:
+            return self.dof_edges
+
+        dof_index = {name: idx for idx, name in enumerate(self.dof_names)}
+        root_dofs = []
+        edge_set = set()
+        queue = [(self.base_link, None)]
+        while queue:
+            current_link, nearest_dof = queue.pop(0)
+            for child in self.kinematic_tree.successors(current_link):
+                joint = self.kinematic_tree[current_link][child]["joint"]
+                child_nearest = nearest_dof
+                if joint.name in dof_index:
+                    child_dof = dof_index[joint.name]
+                    if nearest_dof is None:
+                        root_dofs.append(child_dof)
+                    else:
+                        edge_set.add(tuple(sorted((nearest_dof, child_dof))))
+                    child_nearest = child_dof
+                queue.append((child, child_nearest))
+
+        if include_root_edges:
+            unique_root_dofs = sorted(set(root_dofs))
+            for i, source in enumerate(unique_root_dofs):
+                for target in unique_root_dofs[i + 1 :]:
+                    edge_set.add((source, target))
+
+        edges = tuple(sorted(edge_set))
+        if include_root_edges:
+            self.dof_edges = edges
+        return edges
+
+    def get_dof_edge_names(self, include_root_edges: bool = True):
+        """Return DoF graph edges as joint-name pairs for logging/debugging."""
+        return tuple((self.dof_names[i], self.dof_names[j]) for i, j in self.get_dof_edges(include_root_edges))
+
+    def get_dof_feature_names(self) -> Tuple[str, ...]:
+        """Return names for the URDF-derived DoF feature vector."""
+        return (
+            "axis_x",
+            "axis_y",
+            "axis_z",
+            "type_revolute",
+            "type_continuous",
+            "type_prismatic",
+            "type_other",
+            "limit_lower_scaled",
+            "limit_upper_scaled",
+            "limit_range_scaled",
+            "has_lower_limit",
+            "has_upper_limit",
+            "origin_x",
+            "origin_y",
+            "origin_z",
+            "origin_roll_scaled",
+            "origin_pitch_scaled",
+            "origin_yaw_scaled",
+            "movable_depth_norm",
+            "has_movable_parent",
+            "graph_degree_norm",
+        )
+
+    def _joint_origin_xyz_rpy(self, joint) -> Tuple[Sequence[float], Sequence[float]]:
+        origin = getattr(joint, "origin", None)
+        xyz = origin.xyz if origin is not None and origin.xyz else [0.0, 0.0, 0.0]
+        rpy = origin.rpy if origin is not None and origin.rpy else [0.0, 0.0, 0.0]
+        return xyz, rpy
+
+    def _dof_tree_stats(self) -> Tuple[dict, dict]:
+        dof_index = {name: idx for idx, name in enumerate(self.dof_names)}
+        depths = {}
+        has_parent = {}
+        queue = [(self.base_link, 0, None)]
+        while queue:
+            current_link, movable_depth, nearest_dof = queue.pop(0)
+            for child in self.kinematic_tree.successors(current_link):
+                joint = self.kinematic_tree[current_link][child]["joint"]
+                child_depth = movable_depth
+                child_nearest = nearest_dof
+                if joint.name in dof_index:
+                    child_depth = movable_depth + 1
+                    depths[joint.name] = child_depth
+                    has_parent[joint.name] = 1.0 if nearest_dof is not None else 0.0
+                    child_nearest = dof_index[joint.name]
+                queue.append((child, child_depth, child_nearest))
+        return depths, has_parent
+
+    def get_dof_features(self) -> torch.Tensor:
+        """Return static URDF/kinematic-tree features in action DoF order.
+
+        The graph decoder consumes these as morphology tokens. They deliberately
+        avoid motion data and are safe to cache: joint axis/type/limits, joint
+        origin, movable-tree depth, and graph degree.
+        """
+        if hasattr(self, "dof_features"):
+            return self.dof_features
+
+        feature_names = self.get_dof_feature_names()
+        depths, has_parent = self._dof_tree_stats()
+        max_depth = max(depths.values(), default=1)
+        degrees = {idx: 0 for idx in range(self.num_dofs)}
+        for source, target in self.get_dof_edges():
+            degrees[source] += 1
+            degrees[target] += 1
+
+        features = []
+        for dof_idx, joint_name in enumerate(self.dof_names):
+            joint = self.joint_map[joint_name]
+            axis = np.asarray(joint.axis if joint.axis else [0.0, 0.0, 1.0], dtype=np.float32)
+            axis_norm = float(np.linalg.norm(axis))
+            if axis_norm > 1e-12:
+                axis = axis / axis_norm
+            else:
+                axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+
+            joint_type = joint.type
+            type_features = [
+                1.0 if joint_type == "revolute" else 0.0,
+                1.0 if joint_type == "continuous" else 0.0,
+                1.0 if joint_type == "prismatic" else 0.0,
+                1.0 if joint_type not in {"revolute", "continuous", "prismatic"} else 0.0,
+            ]
+
+            limit = getattr(joint, "limit", None)
+            lower = float(getattr(limit, "lower", np.nan)) if limit is not None else np.nan
+            upper = float(getattr(limit, "upper", np.nan)) if limit is not None else np.nan
+            has_lower = float(np.isfinite(lower))
+            has_upper = float(np.isfinite(upper))
+            scale = np.pi if joint_type in {"revolute", "continuous"} else 1.0
+            lower_scaled = float(np.clip(lower / scale, -10.0, 10.0)) if has_lower else 0.0
+            upper_scaled = float(np.clip(upper / scale, -10.0, 10.0)) if has_upper else 0.0
+            range_scaled = (
+                float(np.clip((upper - lower) / scale, 0.0, 10.0)) if has_lower and has_upper else 0.0
+            )
+
+            origin_xyz, origin_rpy = self._joint_origin_xyz_rpy(joint)
+            origin_xyz = [float(value) for value in origin_xyz]
+            origin_rpy_scaled = [float(np.clip(value / np.pi, -10.0, 10.0)) for value in origin_rpy]
+            depth_norm = float(depths.get(joint_name, 0) / max(max_depth, 1))
+            degree_norm = float(min(degrees.get(dof_idx, 0) / 6.0, 1.0))
+
+            row = [
+                float(axis[0]),
+                float(axis[1]),
+                float(axis[2]),
+                *type_features,
+                lower_scaled,
+                upper_scaled,
+                range_scaled,
+                has_lower,
+                has_upper,
+                *origin_xyz,
+                *origin_rpy_scaled,
+                depth_norm,
+                float(has_parent.get(joint_name, 0.0)),
+                degree_norm,
+            ]
+            if len(row) != len(feature_names):
+                raise RuntimeError(f"DoF feature row has {len(row)} values but expected {len(feature_names)}")
+            features.append(row)
+
+        if features:
+            self.dof_features = torch.tensor(features, dtype=torch.float32, device=self.device)
+        else:
+            self.dof_features = torch.zeros((0, len(feature_names)), dtype=torch.float32, device=self.device)
+        return self.dof_features
         
     def get_end_effectors(self):
         """
@@ -638,7 +815,7 @@ class RobotKinematics(nn.Module):
 
 
 if __name__ == "__main__":
-    fk = RobotKinematics(urdf_path="/home/yyf/codespace/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf", device='cuda')
+    fk = RobotKinematics(urdf_path="/cpfs/user/yaoyifei/codespace/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf", device='cuda')
     dof_pos = torch.rand(1, fk.num_dofs) * 0.1
     dof_pos.requires_grad = True
     dof_pos = dof_pos.to(fk.device)

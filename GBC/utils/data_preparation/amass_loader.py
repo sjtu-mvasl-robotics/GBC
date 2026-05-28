@@ -435,7 +435,7 @@ if __name__ == "__main__":
 
     import time
 
-    dataset = AMASSDatasetInterpolate(root_dir="/home/yyf/dataset", num_betas=16, num_dmpls=8, specialize_dir="/ACCAD/Male1Walking_c3d")
+    dataset = AMASSDatasetInterpolate(root_dir="/cpfs/user/yaoyifei/datasets", num_betas=16, num_dmpls=8, specialize_dir="/ACCAD/Male1Walking_c3d")
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     for i, data in enumerate(dataloader):
         print(data['poses'].shape)

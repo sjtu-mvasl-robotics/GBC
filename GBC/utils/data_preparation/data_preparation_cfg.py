@@ -15,14 +15,14 @@ class BaseCfg:
     smplh_model_path=DATA_PATHS.smplh_model_path
     dmpls_model_path=DATA_PATHS.dmpls_model_path
     urdf_path=DATA_PATHS.urdf_path
-    # root_dir='/home/yyf/dataset'
+    # root_dir='/cpfs/user/yaoyifei/datasets'
     device="cuda"
 
 
 @configclass
 class AMASSDatasetCfg(BaseCfg):
     """AMASS dataset configuration."""
-    root_dir: str = "/home/yifei/dataset/AMASS_FULL"
+    root_dir: str = "/cpfs/user/yaoyifei/datasets/AMASS_FULL"
     num_betas: int = 16
     num_dmpls: int = 8
     load_hands: bool = False

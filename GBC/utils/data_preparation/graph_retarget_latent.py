@@ -1,0 +1,1361 @@
+from typing import Dict, Iterable, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+
+from GBC.utils.data_preparation.pose_transformer import PoseTransformer
+from GBC.utils.data_preparation.temporal_modules import CausalConvTemporalEncoder
+from GBC.utils.data_preparation.spectral_modules import (
+    MultiStreamSpectralAuxiliaryHead,
+)
+from GBC.utils.data_preparation.world_modules import LatentForwardHead
+
+
+DEFAULT_BODY_SLOTS: Tuple[str, ...] = (
+    "global_root",
+    "trunk_head",
+    "left_arm",
+    "right_arm",
+    "left_leg",
+    "right_leg",
+)
+
+
+DEFAULT_BODY_EDGES: Tuple[Tuple[str, str], ...] = (
+    ("global_root", "trunk_head"),
+    ("global_root", "left_leg"),
+    ("global_root", "right_leg"),
+    ("trunk_head", "left_arm"),
+    ("trunk_head", "right_arm"),
+    ("left_arm", "right_arm"),
+    ("left_leg", "right_leg"),
+)
+
+
+DEFAULT_SLOT_JOINTS: Dict[str, Tuple[int, ...]] = {
+    # pose_aa indexes the 21 SMPL-H body joints after the root Pelvis joint.
+    "trunk_head": (2, 5, 8, 11, 12, 13, 14),
+    "left_arm": (15, 17, 19),
+    "right_arm": (16, 18, 20),
+    "left_leg": (0, 3, 6, 9),
+    "right_leg": (1, 4, 7, 10),
+}
+
+DEFAULT_SMPLH_BODY_PARENTS: Tuple[int, ...] = (
+    -1,  # L_Hip
+    -1,  # R_Hip
+    -1,  # Torso
+    0,  # L_Knee
+    1,  # R_Knee
+    2,  # Spine
+    3,  # L_Ankle
+    4,  # R_Ankle
+    5,  # Chest
+    6,  # L_Toe
+    7,  # R_Toe
+    8,  # Neck
+    8,  # L_Thorax
+    8,  # R_Thorax
+    11,  # Head
+    12,  # L_Shoulder
+    13,  # R_Shoulder
+    15,  # L_Elbow
+    16,  # R_Elbow
+    17,  # L_Wrist
+    18,  # R_Wrist
+)
+
+
+def _sinusoidal_position_encoding(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    positions = torch.arange(length, device=device, dtype=dtype).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, device=device, dtype=dtype)
+        * (-torch.log(torch.tensor(10000.0, device=device, dtype=dtype)) / dim)
+    )
+    pe = torch.zeros(length, dim, device=device, dtype=dtype)
+    pe[:, 0::2] = torch.sin(positions * div_term)
+    pe[:, 1::2] = torch.cos(positions * div_term[: pe[:, 1::2].shape[1]])
+    return pe
+
+
+def _edge_attention_mask(
+    slots: Sequence[str],
+    edges: Iterable[Tuple[str, str]],
+    device: torch.device,
+) -> torch.Tensor:
+    slot_to_idx = {name: i for i, name in enumerate(slots)}
+    allowed = torch.eye(len(slots), dtype=torch.bool, device=device)
+
+    for source, target in edges:
+        if source not in slot_to_idx or target not in slot_to_idx:
+            continue
+        i = slot_to_idx[source]
+        j = slot_to_idx[target]
+        allowed[i, j] = True
+        allowed[j, i] = True
+
+    if "global_root" in slot_to_idx:
+        root_idx = slot_to_idx["global_root"]
+        allowed[root_idx, :] = True
+        allowed[:, root_idx] = True
+
+    return ~allowed
+
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+    weight = mask.to(dtype=x.dtype)
+    while weight.ndim < x.ndim:
+        weight = weight.unsqueeze(-1)
+    total = (x * weight).sum(dim=dim)
+    denom = weight.sum(dim=dim).clamp_min(1.0)
+    return total / denom
+
+
+def _attention_mask_from_edges(num_tokens: int, edges: Iterable[Tuple[int, int]], device: torch.device) -> torch.Tensor:
+    allowed = torch.eye(num_tokens, dtype=torch.bool, device=device)
+    for source, target in edges:
+        if 0 <= source < num_tokens and 0 <= target < num_tokens:
+            allowed[source, target] = True
+            allowed[target, source] = True
+    return ~allowed
+
+
+def _slot_index_for_joints(
+    slots: Sequence[str],
+    slot_joints: Dict[str, Tuple[int, ...]],
+    num_human_joints: int,
+) -> torch.Tensor:
+    slot_to_idx = {slot: idx for idx, slot in enumerate(slots)}
+    slot_ids = torch.zeros(num_human_joints + 1, dtype=torch.long)
+    root_idx = slot_to_idx.get("global_root", 0)
+    slot_ids[0] = root_idx
+    for slot, joints in slot_joints.items():
+        if slot not in slot_to_idx:
+            continue
+        for joint_idx in joints:
+            if 0 <= joint_idx < num_human_joints:
+                slot_ids[joint_idx + 1] = slot_to_idx[slot]
+    return slot_ids
+
+
+def _part_mask_to_token_mask(
+    part_mask: torch.Tensor,
+    slot_ids: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    slot_ids = slot_ids.to(device=device)
+    return part_mask.to(device=device, dtype=torch.bool)[:, slot_ids].reshape(batch_size, -1)
+
+
+class GraphTokenBlock(nn.Module):
+    """Self-attention block with a fixed sparse graph mask."""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        x = self.norm1(x + attn_out)
+        return self.norm2(x + self.ffn(x))
+
+
+class HumanSlotTokenizer(nn.Module):
+    """Maps SMPL-style pose/root inputs into canonical body-slot tokens."""
+
+    def __init__(
+        self,
+        num_human_joints: int,
+        beta_dim: int,
+        d_model: int,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        slot_joints: Optional[Dict[str, Sequence[int]]] = None,
+        root_dim: int = 9,
+    ):
+        super().__init__()
+        self.num_human_joints = num_human_joints
+        self.beta_dim = beta_dim
+        self.d_model = d_model
+        self.slots = tuple(slots)
+        self.root_dim = root_dim
+
+        slot_joints = slot_joints or DEFAULT_SLOT_JOINTS
+        self.slot_joints: Dict[str, Tuple[int, ...]] = {}
+        self.slot_mlps = nn.ModuleDict()
+        for slot in self.slots:
+            if slot == "global_root":
+                input_dim = root_dim
+                self.slot_joints[slot] = tuple()
+            else:
+                joints = tuple(j for j in slot_joints.get(slot, ()) if j < num_human_joints)
+                self.slot_joints[slot] = joints
+                input_dim = max(1, len(joints) * 3)
+            self.slot_mlps[slot] = nn.Sequential(
+                nn.Linear(input_dim, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+            )
+
+        self.beta_embed = nn.Sequential(
+            nn.Linear(beta_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.missing_part_tokens = nn.Parameter(torch.zeros(len(self.slots), d_model))
+
+    def forward(
+        self,
+        pose_aa: torch.Tensor,
+        root_pose: torch.Tensor,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pose_aa.ndim != 4:
+            raise ValueError("pose_aa must have shape (B, T, J, 3)")
+        if root_pose.ndim != 3:
+            raise ValueError("root_pose must have shape (B, T, root_dim)")
+
+        batch_size, window, _, _ = pose_aa.shape
+        tokens = []
+        for slot in self.slots:
+            if slot == "global_root":
+                feature = root_pose
+            else:
+                joints = self.slot_joints[slot]
+                if joints:
+                    feature = pose_aa[:, :, joints, :].reshape(batch_size, window, -1)
+                else:
+                    feature = pose_aa.new_zeros(batch_size, window, 1)
+            tokens.append(self.slot_mlps[slot](feature))
+
+        slot_tokens = torch.stack(tokens, dim=2)
+        if beta is None:
+            beta = pose_aa.new_zeros(batch_size, self.beta_dim)
+        beta_token = self.beta_embed(beta).view(batch_size, 1, 1, self.d_model)
+        slot_tokens = slot_tokens + beta_token
+
+        if part_mask is None:
+            part_mask = torch.ones(batch_size, len(self.slots), dtype=torch.bool, device=pose_aa.device)
+        else:
+            part_mask = part_mask.to(device=pose_aa.device, dtype=torch.bool)
+
+        missing = self.missing_part_tokens.view(1, 1, len(self.slots), self.d_model)
+        slot_tokens = torch.where(part_mask.view(batch_size, 1, len(self.slots), 1), slot_tokens, missing)
+        return slot_tokens, part_mask
+
+
+class SkeletalJointTokenizer(nn.Module):
+    """Encode SMPL-H joints first, then pool them into body slots.
+
+    This keeps limb-internal structure visible to the encoder before body-slot
+    fusion. It is intended as the structured alternative to HumanSlotTokenizer's
+    flatten-then-MLP tokenization.
+    """
+
+    def __init__(
+        self,
+        num_human_joints: int,
+        beta_dim: int,
+        d_model: int,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        slot_joints: Optional[Dict[str, Sequence[int]]] = None,
+        root_dim: int = 9,
+        joint_parents: Sequence[int] = DEFAULT_SMPLH_BODY_PARENTS,
+        graph_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        joint_geometry_dim: int = 0,
+        joint_velocity_dim: int = 0,
+        joint_contact_dim: int = 0,
+    ):
+        super().__init__()
+        self.num_human_joints = int(num_human_joints)
+        self.beta_dim = int(beta_dim)
+        self.d_model = int(d_model)
+        self.slots = tuple(slots)
+        self.root_dim = int(root_dim)
+        self.joint_geometry_dim = int(joint_geometry_dim)
+        self.joint_velocity_dim = int(joint_velocity_dim)
+        self.joint_contact_dim = int(joint_contact_dim)
+
+        raw_slot_joints = slot_joints or DEFAULT_SLOT_JOINTS
+        self.slot_joints: Dict[str, Tuple[int, ...]] = {
+            slot: tuple(j for j in raw_slot_joints.get(slot, ()) if j < num_human_joints)
+            for slot in self.slots
+        }
+        slot_ids = _slot_index_for_joints(self.slots, self.slot_joints, self.num_human_joints)
+        self.register_buffer("slot_ids", slot_ids, persistent=False)
+
+        self.pose_embed = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.root_embed = nn.Sequential(
+            nn.Linear(root_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.beta_embed = nn.Sequential(
+            nn.Linear(beta_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.joint_pos_embed = (
+            nn.Sequential(nn.Linear(self.joint_geometry_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+            if self.joint_geometry_dim > 0
+            else None
+        )
+        self.joint_vel_embed = (
+            nn.Sequential(nn.Linear(self.joint_velocity_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+            if self.joint_velocity_dim > 0
+            else None
+        )
+        self.joint_contact_embed = (
+            nn.Sequential(nn.Linear(self.joint_contact_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+            if self.joint_contact_dim > 0
+            else None
+        )
+        self.joint_embed = nn.Embedding(num_human_joints + 1, d_model)
+        self.slot_embed = nn.Embedding(len(self.slots), d_model)
+        self.missing_token = nn.Parameter(torch.zeros(1, 1, 1, d_model))
+        self.graph_blocks = nn.ModuleList(GraphTokenBlock(d_model, num_heads, dropout) for _ in range(graph_layers))
+
+        edges: list[Tuple[int, int]] = []
+        for joint_idx, parent_idx in enumerate(joint_parents[:num_human_joints]):
+            token_idx = joint_idx + 1
+            parent_token_idx = 0 if parent_idx < 0 else parent_idx + 1
+            edges.append((parent_token_idx, token_idx))
+        self.register_buffer(
+            "attn_mask_template",
+            _attention_mask_from_edges(num_human_joints + 1, edges, torch.device("cpu")),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        pose_aa: torch.Tensor,
+        root_pose: torch.Tensor,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+        joint_pos: Optional[torch.Tensor] = None,
+        joint_vel: Optional[torch.Tensor] = None,
+        joint_contact: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pose_aa.ndim != 4:
+            raise ValueError("pose_aa must have shape (B, T, J, 3)")
+        if root_pose.ndim != 3:
+            raise ValueError("root_pose must have shape (B, T, root_dim)")
+
+        batch_size, window, num_joints, _ = pose_aa.shape
+        if num_joints != self.num_human_joints:
+            raise ValueError(f"Expected {self.num_human_joints} human joints, got {num_joints}")
+        if beta is None:
+            beta = pose_aa.new_zeros(batch_size, self.beta_dim)
+        if part_mask is None:
+            part_mask = torch.ones(batch_size, len(self.slots), dtype=torch.bool, device=pose_aa.device)
+        else:
+            part_mask = part_mask.to(device=pose_aa.device, dtype=torch.bool)
+
+        root_token = self.root_embed(root_pose).unsqueeze(2)
+        joint_tokens = self.pose_embed(pose_aa)
+        if joint_pos is not None and self.joint_pos_embed is not None:
+            if joint_pos.shape[:3] != pose_aa.shape[:3]:
+                raise ValueError(f"joint_pos shape must match pose_aa[:3]; got {tuple(joint_pos.shape)}")
+            if joint_pos.shape[-1] != self.joint_geometry_dim:
+                raise ValueError(f"joint_pos last dim must be {self.joint_geometry_dim}; got {joint_pos.shape[-1]}")
+            joint_tokens = joint_tokens + self.joint_pos_embed(joint_pos)
+        if joint_vel is not None and self.joint_vel_embed is not None:
+            if joint_vel.shape[:3] != pose_aa.shape[:3]:
+                raise ValueError(f"joint_vel shape must match pose_aa[:3]; got {tuple(joint_vel.shape)}")
+            if joint_vel.shape[-1] != self.joint_velocity_dim:
+                raise ValueError(f"joint_vel last dim must be {self.joint_velocity_dim}; got {joint_vel.shape[-1]}")
+            joint_tokens = joint_tokens + self.joint_vel_embed(joint_vel)
+        if joint_contact is not None and self.joint_contact_embed is not None:
+            if joint_contact.shape[:3] != pose_aa.shape[:3]:
+                raise ValueError(f"joint_contact shape must match pose_aa[:3]; got {tuple(joint_contact.shape)}")
+            if joint_contact.shape[-1] != self.joint_contact_dim:
+                raise ValueError(f"joint_contact last dim must be {self.joint_contact_dim}; got {joint_contact.shape[-1]}")
+            joint_tokens = joint_tokens + self.joint_contact_embed(joint_contact)
+        tokens = torch.cat([root_token, joint_tokens], dim=2)
+
+        token_count = self.num_human_joints + 1
+        joint_ids = torch.arange(token_count, device=pose_aa.device)
+        slot_ids = self.slot_ids.to(device=pose_aa.device)
+        tokens = tokens + self.joint_embed(joint_ids).view(1, 1, token_count, -1)
+        tokens = tokens + self.slot_embed(slot_ids).view(1, 1, token_count, -1)
+        tokens = tokens + self.beta_embed(beta).view(batch_size, 1, 1, self.d_model)
+
+        token_mask = _part_mask_to_token_mask(part_mask, self.slot_ids, batch_size, pose_aa.device)
+        tokens = torch.where(token_mask.view(batch_size, 1, token_count, 1), tokens, self.missing_token)
+
+        flat = tokens.reshape(batch_size * window, token_count, self.d_model)
+        key_padding_mask = ~token_mask[:, None, :].expand(batch_size, window, token_count).reshape(
+            batch_size * window, token_count
+        )
+        attn_mask = self.attn_mask_template.to(device=pose_aa.device)
+        for block in self.graph_blocks:
+            flat = block(flat, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        tokens = flat.reshape(batch_size, window, token_count, self.d_model)
+
+        slot_tokens = []
+        for slot_idx, slot in enumerate(self.slots):
+            if slot == "global_root":
+                slot_tokens.append(tokens[:, :, 0, :])
+                continue
+            joints = self.slot_joints.get(slot, ())
+            if joints:
+                token_indices = torch.tensor([j + 1 for j in joints], device=pose_aa.device, dtype=torch.long)
+                slot_tokens.append(tokens.index_select(2, token_indices).mean(dim=2))
+            else:
+                slot_tokens.append(tokens.new_zeros(batch_size, window, self.d_model))
+        return torch.stack(slot_tokens, dim=2), part_mask
+
+
+class GraphFuseBlock(nn.Module):
+    """Masked graph attention over canonical body slots for each frame."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.slots = tuple(slots)
+        self.edges = tuple(edges)
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, part_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, window, num_slots, d_model = x.shape
+        flat = x.reshape(batch_size * window, num_slots, d_model)
+        key_padding_mask = ~part_mask[:, None, :].expand(batch_size, window, num_slots).reshape(batch_size * window, num_slots)
+        attn_mask = _edge_attention_mask(self.slots, self.edges, x.device)
+
+        attn_out, _ = self.attn(flat, flat, flat, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        flat = self.norm1(flat + attn_out)
+        flat = self.norm2(flat + self.ffn(flat))
+        return flat.reshape(batch_size, window, num_slots, d_model)
+
+
+class GraphTemporalEncoder(nn.Module):
+    # Bidirectional transformer over (T * num_slots) tokens — acausal.
+    # These class-level attributes exist so the trainer's metric logging
+    # (getattr(model.encoder, "is_causal", default)) reports the correct
+    # value without falling back to a default.
+    is_causal: bool = False
+    total_lookahead_frames: int = -1  # sentinel: "full window" (set per-call below)
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
+        graph_layers: int = 2,
+        temporal_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.slots = tuple(slots)
+        self.slot_embed = nn.Parameter(torch.randn(1, 1, len(self.slots), d_model) * 0.02)
+        self.graph_blocks = nn.ModuleList(
+            GraphFuseBlock(d_model, num_heads, self.slots, edges, dropout) for _ in range(graph_layers)
+        )
+        temporal_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.temporal_encoder = nn.TransformerEncoder(temporal_layer, num_layers=temporal_layers)
+
+    def forward(self, slot_tokens: torch.Tensor, part_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, window, num_slots, d_model = slot_tokens.shape
+        x = slot_tokens + self.slot_embed
+
+        for block in self.graph_blocks:
+            x = block(x, part_mask)
+
+        time_pos = _sinusoidal_position_encoding(window, d_model, x.device, x.dtype)
+        x = x + time_pos.view(1, window, 1, d_model)
+        flat = x.reshape(batch_size, window * num_slots, d_model)
+        temporal_mask = ~part_mask[:, None, :].expand(batch_size, window, num_slots).reshape(batch_size, window * num_slots)
+        flat = self.temporal_encoder(flat, src_key_padding_mask=temporal_mask)
+        return flat.reshape(batch_size, window, num_slots, d_model)
+
+
+class RetargetDecoder(nn.Module):
+    def __init__(
+        self,
+        z_dim: int,
+        beta_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        robot_embedding_dim: int = 0,
+        num_robot_types: int = 1,
+    ):
+        super().__init__()
+        self.robot_embedding_dim = robot_embedding_dim
+        self.beta_embed = nn.Sequential(
+            nn.Linear(beta_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        if robot_embedding_dim > 0:
+            self.robot_embed = nn.Embedding(num_robot_types, robot_embedding_dim)
+        else:
+            self.robot_embed = None
+
+        input_dim = z_dim + hidden_dim + robot_embedding_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        beta: Optional[torch.Tensor],
+        robot_id: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, window, _ = z.shape
+        if beta is None:
+            beta = z.new_zeros(batch_size, self.beta_embed[0].in_features)
+        beta_token = self.beta_embed(beta).unsqueeze(1).expand(batch_size, window, -1)
+        features = [z, beta_token]
+
+        if self.robot_embed is not None:
+            if robot_id is None:
+                robot_id = torch.zeros(batch_size, dtype=torch.long, device=z.device)
+            robot_token = self.robot_embed(robot_id).unsqueeze(1).expand(batch_size, window, -1)
+            features.append(robot_token)
+
+        return self.net(torch.cat(features, dim=-1))
+
+
+def _build_robot_dof_edges(
+    robot_dof_edges: Optional[Sequence[Tuple[int, int]]],
+    num_actions: int,
+) -> Tuple[Tuple[int, int], ...]:
+    if robot_dof_edges is None:
+        raise ValueError("robot_dof_edges must be provided for the structured robot graph decoder.")
+
+    edge_set = set()
+    for source, target in robot_dof_edges:
+        source_idx = int(source)
+        target_idx = int(target)
+        if source_idx == target_idx:
+            continue
+        if not (0 <= source_idx < num_actions and 0 <= target_idx < num_actions):
+            raise ValueError(
+                f"robot_dof_edges contains out-of-range edge {(source_idx, target_idx)} "
+                f"for {num_actions} actions"
+            )
+        edge_set.add(tuple(sorted((source_idx, target_idx))))
+    if num_actions > 1 and not edge_set:
+        raise ValueError("robot_dof_edges produced an empty graph for a multi-DoF robot.")
+    return tuple(sorted(edge_set))
+
+
+class TemporalConvBlock(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, kernel_size: int = 5):
+        super().__init__()
+        padding = kernel_size // 2
+        self.norm = nn.LayerNorm(d_model)
+        self.net = nn.Sequential(
+            nn.Conv1d(d_model, d_model * 2, kernel_size=kernel_size, padding=padding),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(d_model * 2, d_model, kernel_size=1),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, window, num_tokens, d_model = x.shape
+        flat = self.norm(x).permute(0, 2, 3, 1).reshape(batch_size * num_tokens, d_model, window)
+        flat = self.net(flat)
+        flat = flat.reshape(batch_size, num_tokens, d_model, window).permute(0, 3, 1, 2)
+        return x + flat
+
+
+class RobotActionAdapter(nn.Module):
+    """Base interface for robot-conditioned action decoders."""
+
+    robot_dof_graph_source: str = "unknown"
+    robot_dof_edge_count: int = 0
+    robot_dof_feature_dim: int = 0
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        beta: Optional[torch.Tensor],
+        robot_id: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class RobotGraphActionDecoder(RobotActionAdapter):
+    """Decode per-frame latent through robot dof tokens and a robot graph."""
+
+    def __init__(
+        self,
+        z_dim: int,
+        beta_dim: int,
+        output_dim: int,
+        d_model: int,
+        num_heads: int,
+        robot_dof_names: Optional[Sequence[str]] = None,
+        robot_dof_edges: Optional[Sequence[Tuple[int, int]]] = None,
+        robot_dof_features: Optional[torch.Tensor] = None,
+        robot_embedding_dim: int = 0,
+        num_robot_types: int = 1,
+        graph_layers: int = 2,
+        temporal_layers: int = 2,
+        context_dim: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.output_dim = int(output_dim)
+        self.d_model = int(d_model)
+        self.robot_embedding_dim = int(robot_embedding_dim)
+        self.robot_dof_names = tuple(robot_dof_names or ())
+        self.z_embed = nn.Sequential(nn.Linear(z_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.beta_embed = nn.Sequential(nn.Linear(beta_dim, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.dof_embed = nn.Embedding(output_dim, d_model)
+        if robot_dof_features is None:
+            feature_tensor = torch.zeros(output_dim, 0, dtype=torch.float32)
+        else:
+            feature_tensor = torch.as_tensor(robot_dof_features, dtype=torch.float32).detach().clone()
+            if feature_tensor.ndim != 2 or feature_tensor.shape[0] != output_dim:
+                raise ValueError(
+                    "robot_dof_features must have shape "
+                    f"({output_dim}, F), got {tuple(feature_tensor.shape)}"
+                )
+        self.robot_dof_feature_dim = int(feature_tensor.shape[-1])
+        self.register_buffer("robot_dof_features", feature_tensor, persistent=False)
+        if self.robot_dof_feature_dim > 0:
+            self.robot_dof_feature_proj = nn.Sequential(
+                nn.Linear(self.robot_dof_feature_dim, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+            )
+        else:
+            self.robot_dof_feature_proj = None
+        if robot_embedding_dim > 0:
+            self.robot_embed = nn.Embedding(num_robot_types, d_model)
+        else:
+            self.robot_embed = None
+        self.context_proj = nn.Linear(context_dim or d_model, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.cross_norm = nn.LayerNorm(d_model)
+
+        self.graph_blocks = nn.ModuleList(GraphTokenBlock(d_model, num_heads, dropout) for _ in range(graph_layers))
+        self.temporal_blocks = nn.ModuleList(TemporalConvBlock(d_model, dropout) for _ in range(temporal_layers))
+        edges = _build_robot_dof_edges(robot_dof_edges, output_dim)
+        self.robot_dof_graph_source = "kinematic_tree"
+        self.robot_dof_edge_count = len(edges)
+        self.register_buffer(
+            "attn_mask_template",
+            _attention_mask_from_edges(output_dim, edges, torch.device("cpu")),
+            persistent=False,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        beta: Optional[torch.Tensor],
+        robot_id: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size, window, _ = z.shape
+        if beta is None:
+            beta = z.new_zeros(batch_size, self.beta_embed[0].in_features)
+
+        dof_ids = torch.arange(self.output_dim, device=z.device)
+        x = self.dof_embed(dof_ids).view(1, 1, self.output_dim, self.d_model)
+        if self.robot_dof_feature_proj is not None:
+            dof_features = self.robot_dof_features.to(device=z.device, dtype=self.dof_embed.weight.dtype)
+            feature_token = self.robot_dof_feature_proj(dof_features).to(dtype=x.dtype)
+            x = x + feature_token.view(1, 1, self.output_dim, self.d_model)
+        x = x + self.z_embed(z).unsqueeze(2) + self.beta_embed(beta).view(batch_size, 1, 1, self.d_model)
+        if self.robot_embed is not None:
+            if robot_id is None:
+                robot_id = torch.zeros(batch_size, dtype=torch.long, device=z.device)
+            x = x + self.robot_embed(robot_id).view(batch_size, 1, 1, self.d_model)
+        x = x.expand(batch_size, window, self.output_dim, self.d_model)
+
+        if context is not None:
+            ctx = self.context_proj(context).reshape(batch_size * window, context.shape[2], self.d_model)
+            flat = x.reshape(batch_size * window, self.output_dim, self.d_model)
+            key_padding_mask = None
+            if context_mask is not None:
+                key_padding_mask = ~context_mask[:, None, :].expand(batch_size, window, context.shape[2]).reshape(
+                    batch_size * window, context.shape[2]
+                )
+            attn_out, _ = self.cross_attn(flat, ctx, ctx, key_padding_mask=key_padding_mask)
+            x = self.cross_norm(flat + attn_out).reshape(batch_size, window, self.output_dim, self.d_model)
+
+        flat = x.reshape(batch_size * window, self.output_dim, self.d_model)
+        attn_mask = self.attn_mask_template.to(device=z.device)
+        for block in self.graph_blocks:
+            flat = block(flat, attn_mask=attn_mask)
+        x = flat.reshape(batch_size, window, self.output_dim, self.d_model)
+
+        time_pos = _sinusoidal_position_encoding(window, self.d_model, z.device, z.dtype)
+        x = x + time_pos.view(1, window, 1, self.d_model)
+        for block in self.temporal_blocks:
+            x = block(x)
+        return self.head(x).squeeze(-1)
+
+
+class FutureSlotHead(nn.Module):
+    def __init__(
+        self,
+        z_dim: int,
+        d_model: int,
+        num_slots: int,
+        future_offsets: Sequence[int],
+        future_slot_dim: int,
+    ):
+        super().__init__()
+        self.future_offsets = tuple(future_offsets)
+        self.num_slots = num_slots
+        self.future_slot_dim = future_slot_dim
+        self.offset_embed = nn.Embedding(len(self.future_offsets), d_model)
+        self.net = nn.Sequential(
+            nn.Linear(z_dim + d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_slots * future_slot_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self.future_offsets:
+            return None
+
+        batch_size, window, _ = z.shape
+        outputs = []
+        for offset_idx in range(len(self.future_offsets)):
+            offset = self.offset_embed.weight[offset_idx].view(1, 1, -1).expand(batch_size, window, -1)
+            pred = self.net(torch.cat([z, offset], dim=-1))
+            outputs.append(pred.view(batch_size, window, self.num_slots, self.future_slot_dim))
+        return torch.stack(outputs, dim=2)
+
+
+class GraphRetargetVAE(nn.Module):
+    """UPP-style canonical body-slot graph fuse network for GMR-SFT retargeting."""
+
+    def __init__(
+        self,
+        num_human_joints: int = 21,
+        robot_action_dim: int = 29,
+        beta_dim: int = 16,
+        root_dim: int = 9,
+        d_model: int = 256,
+        z_dim: int = 256,
+        slot_latent_dim: int = 32,
+        graph_layers: int = 2,
+        temporal_layers: int = 4,
+        num_heads: int = 8,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
+        future_offsets: Sequence[int] = (1, 5, 10),
+        future_slot_dim: int = 16,
+        num_robot_types: int = 1,
+        robot_embedding_dim: int = 32,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_human_joints = num_human_joints
+        self.robot_action_dim = robot_action_dim
+        self.beta_dim = beta_dim
+        self.root_dim = root_dim
+        self.d_model = d_model
+        self.z_dim = z_dim
+        self.slots = tuple(slots)
+
+        self.tokenizer = HumanSlotTokenizer(
+            num_human_joints=num_human_joints,
+            beta_dim=beta_dim,
+            d_model=d_model,
+            slots=self.slots,
+            root_dim=root_dim,
+        )
+        self.encoder = GraphTemporalEncoder(
+            d_model=d_model,
+            num_heads=num_heads,
+            slots=self.slots,
+            edges=edges,
+            graph_layers=graph_layers,
+            temporal_layers=temporal_layers,
+            dropout=dropout,
+        )
+        self.slot_projector = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, slot_latent_dim),
+        )
+        self.mu_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+        self.logvar_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+
+        hidden_dim = max(d_model, z_dim)
+        self.human_decoder = RetargetDecoder(
+            z_dim=z_dim,
+            beta_dim=beta_dim,
+            output_dim=num_human_joints * 3 + root_dim,
+            hidden_dim=hidden_dim,
+        )
+        self.robot_decoder = RetargetDecoder(
+            z_dim=z_dim,
+            beta_dim=beta_dim,
+            output_dim=root_dim + robot_action_dim,
+            hidden_dim=hidden_dim,
+            robot_embedding_dim=robot_embedding_dim,
+            num_robot_types=num_robot_types,
+        )
+        self.future_head = FutureSlotHead(
+            z_dim=z_dim,
+            d_model=d_model,
+            num_slots=len(self.slots),
+            future_offsets=future_offsets,
+            future_slot_dim=future_slot_dim,
+        )
+
+    def encode(
+        self,
+        pose_aa: torch.Tensor,
+        root_pose: torch.Tensor,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        slot_tokens, part_mask = self.tokenizer(pose_aa, root_pose, beta, part_mask)
+        graph_hidden = self.encoder(slot_tokens, part_mask)
+        pooled = _masked_mean(graph_hidden, part_mask[:, None, :], dim=2)
+        slot_latents = self.slot_projector(graph_hidden)
+        return {
+            "mu": self.mu_head(pooled),
+            "logvar": self.logvar_head(pooled),
+            "slot_latents": slot_latents,
+            "graph_hidden": graph_hidden,
+            "part_mask": part_mask,
+        }
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor, sample: bool) -> torch.Tensor:
+        if not sample:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(
+        self,
+        pose_aa: torch.Tensor,
+        root_pose: torch.Tensor,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+        robot_id: Optional[torch.Tensor] = None,
+        sample: Optional[bool] = None,
+    ) -> Dict[str, torch.Tensor]:
+        encoded = self.encode(pose_aa=pose_aa, root_pose=root_pose, beta=beta, part_mask=part_mask)
+        if sample is None:
+            sample = self.training
+        z = self.reparameterize(encoded["mu"], encoded["logvar"], sample=sample)
+
+        batch_size, window, _ = pose_aa.shape[:3]
+        human_out = self.human_decoder(z, beta)
+        robot_out = self.robot_decoder(z, beta, robot_id=robot_id)
+        human_pose = human_out[..., : self.num_human_joints * 3].view(batch_size, window, self.num_human_joints, 3)
+        human_root = human_out[..., self.num_human_joints * 3 :]
+        robot_root = robot_out[..., : self.root_dim]
+        robot_actions = robot_out[..., self.root_dim :]
+
+        output = {
+            "z": z,
+            "mu": encoded["mu"],
+            "logvar": encoded["logvar"],
+            "slot_latents": encoded["slot_latents"],
+            "graph_hidden": encoded["graph_hidden"],
+            "part_mask": encoded["part_mask"],
+            "human_pose_aa": human_pose,
+            "human_root_pose": human_root,
+            "robot_root_pose": robot_root,
+            "robot_actions": robot_actions,
+        }
+        future_slots = self.future_head(z)
+        if future_slots is not None:
+            output["future_slots"] = future_slots
+        return output
+
+
+class UnifiedLatentRetargeter(nn.Module):
+    """Canonical body-slot sequence latent retargeter.
+
+    The graph encoder produces a per-frame shared latent from body-part slots.
+    The primary path decodes that latent sequence directly to robot actions.
+    The legacy frame/base path is retained only for base/blend compatibility and
+    can be skipped in latent-only training.
+    """
+
+    def __init__(
+        self,
+        load_hands: bool = False,
+        num_actions: int = 29,
+        beta_dim: int = 16,
+        root_dim: int = 9,
+        d_model: int = 256,
+        z_dim: int = 256,
+        slot_latent_dim: int = 32,
+        graph_layers: int = 2,
+        temporal_layers: int = 4,
+        num_heads: int = 8,
+        slots: Sequence[str] = DEFAULT_BODY_SLOTS,
+        edges: Iterable[Tuple[str, str]] = DEFAULT_BODY_EDGES,
+        frame_embedding_dim: int = 32,
+        frame_joint_embedding_dim: int = 128,
+        frame_num_heads: int = 4,
+        frame_num_layers: int = 4,
+        robot_embedding_dim: int = 0,
+        num_robot_types: int = 1,
+        residual_hidden_dim: Optional[int] = None,
+        dropout: float = 0.1,
+        residual_scale: float = 0.25,
+        teacher_base_blend: float = 1.0,
+        ref_base_height: float = 0.8,
+        root_height_range: float = 0.6,
+        latent_architecture: str = "structured",
+        robot_dof_names: Optional[Sequence[str]] = None,
+        robot_dof_edges: Optional[Sequence[Tuple[int, int]]] = None,
+        robot_dof_features: Optional[torch.Tensor] = None,
+        decoder_graph_layers: int = 2,
+        decoder_temporal_layers: int = 2,
+        frame_chunk_size: int = 4096,
+        joint_geometry_dim: int = 0,
+        joint_velocity_dim: int = 0,
+        joint_contact_dim: int = 0,
+        temporal_module: str = "transformer",
+        temporal_kernel: int = 5,
+        temporal_dilations: Tuple[int, ...] = (1, 2, 4, 8),
+        temporal_num_layers: Optional[int] = None,
+        temporal_lookahead_frames: int = 0,
+        spectral_aux_enabled: bool = False,
+        spectral_aux_substream_dims: Optional[Dict[str, int]] = None,
+        spectral_aux_substream_M: Optional[Dict[str, int]] = None,
+        spectral_aux_hidden: int = 256,
+        world_aux_enabled: bool = False,
+        world_aux_hidden: int = 512,
+        world_aux_num_layers: int = 3,
+    ):
+        super().__init__()
+        self.load_hands = bool(load_hands)
+        self.num_joints = 21 if not load_hands else 51
+        if self.num_joints != 21:
+            raise ValueError("UnifiedLatentRetargeter currently supports SMPL-H body joints without hands")
+        self.joint_geometry_dim = int(joint_geometry_dim)
+        self.joint_velocity_dim = int(joint_velocity_dim)
+        self.joint_contact_dim = int(joint_contact_dim)
+        self.num_actions = int(num_actions)
+        self.beta_dim = int(beta_dim)
+        self.root_dim = int(root_dim)
+        self.d_model = int(d_model)
+        self.z_dim = int(z_dim)
+        self.slots = tuple(slots)
+        self.residual_scale = float(residual_scale)
+        self.teacher_base_blend = float(teacher_base_blend)
+        self.root_height_range = float(root_height_range)
+        self.latent_architecture = str(latent_architecture)
+        self.frame_chunk_size = int(frame_chunk_size)
+        self.register_buffer("ref_base_height", torch.tensor(float(ref_base_height), dtype=torch.float32))
+        if self.latent_architecture not in {"baseline", "structured"}:
+            raise ValueError(f"Unknown latent_architecture: {latent_architecture}")
+
+        self.frame_model = PoseTransformer(
+            load_hands=load_hands,
+            num_actions=num_actions,
+            embedding_dim=frame_embedding_dim,
+            joint_embedding_dim=frame_joint_embedding_dim,
+            num_heads=frame_num_heads,
+            num_layers=frame_num_layers,
+        )
+        if self.latent_architecture == "structured":
+            self.tokenizer = SkeletalJointTokenizer(
+                num_human_joints=self.num_joints,
+                beta_dim=beta_dim,
+                d_model=d_model,
+                slots=self.slots,
+                root_dim=root_dim,
+                graph_layers=graph_layers,
+                num_heads=num_heads,
+                dropout=dropout,
+                joint_geometry_dim=self.joint_geometry_dim,
+                joint_velocity_dim=self.joint_velocity_dim,
+                joint_contact_dim=self.joint_contact_dim,
+            )
+        else:
+            self.tokenizer = HumanSlotTokenizer(
+                num_human_joints=self.num_joints,
+                beta_dim=beta_dim,
+                d_model=d_model,
+                slots=self.slots,
+                root_dim=root_dim,
+            )
+        self.temporal_module = str(temporal_module)
+        encoder_temporal_layers = (
+            temporal_layers if temporal_num_layers is None else int(temporal_num_layers)
+        )
+        if self.temporal_module == "transformer":
+            self.encoder = GraphTemporalEncoder(
+                d_model=d_model,
+                num_heads=num_heads,
+                slots=self.slots,
+                edges=edges,
+                graph_layers=graph_layers,
+                temporal_layers=encoder_temporal_layers,
+                dropout=dropout,
+            )
+        elif self.temporal_module in {"causal_conv", "lookahead_conv"}:
+            if self.temporal_module == "causal_conv" and int(temporal_lookahead_frames) != 0:
+                raise ValueError(
+                    "temporal_module='causal_conv' requires temporal_lookahead_frames == 0; "
+                    f"got {temporal_lookahead_frames}. Use 'lookahead_conv' for non-zero lookahead."
+                )
+            self.encoder = CausalConvTemporalEncoder(
+                d_model=d_model,
+                num_heads=num_heads,
+                slots=self.slots,
+                edges=edges,
+                num_layers=encoder_temporal_layers,
+                kernel_size=int(temporal_kernel),
+                dilations=tuple(int(d) for d in temporal_dilations),
+                total_lookahead_frames=int(temporal_lookahead_frames),
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unknown temporal_module: {self.temporal_module}. "
+                "Choose from: transformer, causal_conv, lookahead_conv."
+            )
+        self.slot_projector = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, slot_latent_dim),
+        )
+        self.mu_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+        self.logvar_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, z_dim))
+
+        decoder_hidden = max(d_model, z_dim)
+        if self.latent_architecture == "structured":
+            self.latent_action_decoder = RobotGraphActionDecoder(
+                z_dim=z_dim,
+                beta_dim=beta_dim,
+                output_dim=num_actions,
+                d_model=decoder_hidden,
+                num_heads=num_heads,
+                robot_dof_names=robot_dof_names,
+                robot_dof_edges=robot_dof_edges,
+                robot_dof_features=robot_dof_features,
+                robot_embedding_dim=robot_embedding_dim,
+                num_robot_types=num_robot_types,
+                graph_layers=decoder_graph_layers,
+                temporal_layers=decoder_temporal_layers,
+                context_dim=d_model,
+                dropout=dropout,
+            )
+        else:
+            self.latent_action_decoder = RetargetDecoder(
+                z_dim=z_dim,
+                beta_dim=beta_dim,
+                output_dim=num_actions,
+                hidden_dim=decoder_hidden,
+                robot_embedding_dim=robot_embedding_dim,
+                num_robot_types=num_robot_types,
+            )
+
+        residual_hidden = int(residual_hidden_dim or decoder_hidden)
+        self.root_embed = nn.Sequential(
+            nn.Linear(root_dim, residual_hidden),
+            nn.GELU(),
+            nn.LayerNorm(residual_hidden),
+        )
+        # Human reconstruction decoder — makes this a true VAE on the human side.
+        # Output = (num_joints * 3) pose_aa + root_dim root features. Without this
+        # decoder the latent has no incentive to encode motion semantics; it's only
+        # judged by whether the robot actions it produces are good.
+        self.human_decoder = RetargetDecoder(
+            z_dim=z_dim,
+            beta_dim=beta_dim,
+            output_dim=self.num_joints * 3 + root_dim,
+            hidden_dim=decoder_hidden,
+        )
+        # Optional auxiliary heads (spectral aux, world aux) are constructed
+        # inside fork_rng so they do not consume RNG from the global stream
+        # and shift initialization of downstream modules (residual_head,
+        # root_height_head). Without this, enabling/disabling an aux head
+        # would silently change the initialization of every parameter
+        # constructed afterwards — invalidating any "controlled ablation"
+        # comparison between aux-on and aux-off runs at the same seed.
+        self.spectral_aux_enabled = bool(spectral_aux_enabled)
+        if self.spectral_aux_enabled:
+            if spectral_aux_substream_dims is None or spectral_aux_substream_M is None:
+                raise ValueError(
+                    "spectral_aux_enabled=True requires substream_dims and substream_M dicts"
+                )
+            with torch.random.fork_rng(devices=[]):
+                self.spectral_aux_head = MultiStreamSpectralAuxiliaryHead(
+                    z_dim=z_dim,
+                    substream_dims=dict(spectral_aux_substream_dims),
+                    substream_M=dict(spectral_aux_substream_M),
+                    hidden=int(spectral_aux_hidden),
+                    dropout=float(dropout),
+                )
+        else:
+            self.spectral_aux_head = None
+        self.world_aux_enabled = bool(world_aux_enabled)
+        if self.world_aux_enabled:
+            with torch.random.fork_rng(devices=[]):
+                self.world_head = LatentForwardHead(
+                    z_dim=z_dim,
+                    action_dim=int(num_actions),
+                    hidden=int(world_aux_hidden),
+                    num_layers=int(world_aux_num_layers),
+                    dropout=float(dropout),
+                )
+        else:
+            self.world_head = None
+        self.residual_head = nn.Sequential(
+            nn.Linear(z_dim + num_actions * 2 + residual_hidden, residual_hidden),
+            nn.GELU(),
+            nn.LayerNorm(residual_hidden),
+            nn.Dropout(dropout),
+            nn.Linear(residual_hidden, residual_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(residual_hidden, num_actions),
+        )
+        self.root_height_head = nn.Sequential(
+            nn.Linear(z_dim + residual_hidden, residual_hidden),
+            nn.GELU(),
+            nn.LayerNorm(residual_hidden),
+            nn.Dropout(dropout),
+            nn.Linear(residual_hidden, 1),
+        )
+        self._zero_init_residual()
+        self._zero_init_root_height()
+
+    def _zero_init_residual(self) -> None:
+        last = self.residual_head[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def _zero_init_root_height(self) -> None:
+        last = self.root_height_head[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def encode_frames(self, pose_body: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pose_body.ndim != 3:
+            raise ValueError(f"pose_body must have shape (B, T, D), got {tuple(pose_body.shape)}")
+        batch_size, window, dim = pose_body.shape
+        expected = self.num_joints * 3
+        if dim != expected:
+            raise ValueError(f"pose_body last dim must be {expected}, got {dim}")
+
+        flat = pose_body.reshape(batch_size * window, self.num_joints, 3)
+        frame_features_out = []
+        base_actions_out = []
+        chunk_size = self.frame_chunk_size if self.frame_chunk_size > 0 else flat.shape[0]
+        for start in range(0, flat.shape[0], chunk_size):
+            chunk = flat[start : start + chunk_size]
+            x = chunk.permute(0, 2, 1)
+            x = self.frame_model.joint_embedding(x)
+            x = x.permute(0, 2, 1)
+            x = self.frame_model.embedding(x)
+            x = x + self.frame_model.positional_encoding
+            x = self.frame_model.transformer(x)
+            frame_features = x.mean(dim=1)
+            frame_features_out.append(frame_features)
+            base_actions_out.append(self.frame_model.decoder(frame_features))
+        frame_features = torch.cat(frame_features_out, dim=0)
+        base_actions = torch.cat(base_actions_out, dim=0)
+        return (
+            frame_features.reshape(batch_size, window, -1),
+            base_actions.reshape(batch_size, window, -1),
+        )
+
+    def encode_latent(
+        self,
+        pose_aa: torch.Tensor,
+        root_features: torch.Tensor,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+        joint_pos: Optional[torch.Tensor] = None,
+        joint_vel: Optional[torch.Tensor] = None,
+        joint_contact: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if isinstance(self.tokenizer, SkeletalJointTokenizer):
+            slot_tokens, part_mask = self.tokenizer(
+                pose_aa, root_features, beta, part_mask,
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                joint_contact=joint_contact,
+            )
+        else:
+            slot_tokens, part_mask = self.tokenizer(pose_aa, root_features, beta, part_mask)
+        graph_hidden = self.encoder(slot_tokens, part_mask)
+        pooled = _masked_mean(graph_hidden, part_mask[:, None, :], dim=2)
+        return {
+            "mu": self.mu_head(pooled),
+            "logvar": self.logvar_head(pooled),
+            "slot_latents": self.slot_projector(graph_hidden),
+            "graph_hidden": graph_hidden,
+            "part_mask": part_mask,
+        }
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor, sample: bool) -> torch.Tensor:
+        if not sample:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def forward(
+        self,
+        pose_body: torch.Tensor,
+        root_features: Optional[torch.Tensor] = None,
+        beta: Optional[torch.Tensor] = None,
+        part_mask: Optional[torch.Tensor] = None,
+        robot_id: Optional[torch.Tensor] = None,
+        sample: Optional[bool] = None,
+        base_blend: Optional[float] = None,
+        use_frame_path: bool = True,
+        joint_pos: Optional[torch.Tensor] = None,
+        joint_vel: Optional[torch.Tensor] = None,
+        joint_contact: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, window, dim = pose_body.shape
+        if dim != self.num_joints * 3:
+            raise ValueError(f"pose_body last dim must be {self.num_joints * 3}, got {dim}")
+        if root_features is None:
+            root_features = pose_body.new_zeros(batch_size, window, self.root_dim)
+        if root_features.shape[:2] != (batch_size, window) or root_features.shape[-1] != self.root_dim:
+            raise ValueError(
+                "root_features must have shape "
+                f"({batch_size}, {window}, {self.root_dim}), got {tuple(root_features.shape)}"
+            )
+
+        pose_aa = pose_body.reshape(batch_size, window, self.num_joints, 3)
+        encoded = self.encode_latent(
+            pose_aa, root_features, beta=beta, part_mask=part_mask,
+            joint_pos=joint_pos, joint_vel=joint_vel, joint_contact=joint_contact,
+        )
+        if sample is None:
+            sample = self.training
+        z = self.reparameterize(encoded["mu"], encoded["logvar"], sample=sample)
+        if self.latent_architecture == "structured":
+            latent_actions = self.latent_action_decoder(
+                z,
+                beta,
+                robot_id=robot_id,
+                context=encoded["graph_hidden"],
+                context_mask=encoded["part_mask"],
+            )
+        else:
+            latent_actions = self.latent_action_decoder(z, beta, robot_id=robot_id)
+        root_token = self.root_embed(root_features)
+        blend = self.teacher_base_blend if base_blend is None else float(base_blend)
+        if use_frame_path:
+            _, base_actions = self.encode_frames(pose_body)
+            residual_input = torch.cat([z, latent_actions, base_actions, root_token], dim=-1)
+            residual = self.residual_head(residual_input) * self.residual_scale
+            actions = blend * base_actions + (1.0 - blend) * latent_actions + residual
+        else:
+            base_actions = torch.zeros_like(latent_actions)
+            residual = torch.zeros_like(latent_actions)
+            actions = latent_actions
+        root_height_delta = self.root_height_head(torch.cat([z, root_token], dim=-1))
+        root_height = self.ref_base_height.to(device=z.device, dtype=z.dtype).view(1, 1, 1)
+        root_height = root_height + self.root_height_range * torch.tanh(root_height_delta)
+
+        # Human reconstruction (decodes z back into SMPL pose + root). Required for
+        # the latent to be a real motion-prior VAE rather than a translator.
+        human_out = self.human_decoder(z, beta)
+        human_pose_aa_recon = human_out[..., : self.num_joints * 3].view(
+            batch_size, window, self.num_joints, 3
+        )
+        human_root_recon = human_out[..., self.num_joints * 3 :]
+
+        spectral_aux_pred: Optional[Dict[str, torch.Tensor]] = None
+        if self.spectral_aux_head is not None:
+            spectral_aux_pred = self.spectral_aux_head(z)
+
+        # NOTE: world_head is intentionally NOT called inside forward(). It
+        # lives as an attribute (`self.world_head`) so the trainer can pick
+        # the action source explicitly (model-predicted vs. GMR reference).
+        # See compute_losses() in train_graph_latent.py and the
+        # `--world-aux-action-source` CLI flag.
+
+        out = {
+            "actions": actions,
+            "base_actions": base_actions,
+            "latent_actions": latent_actions,
+            "residual": residual,
+            "z": z,
+            "root_height": root_height,
+            "latent_root_height": root_height,
+            "mu": encoded["mu"],
+            "logvar": encoded["logvar"],
+            "slot_latents": encoded["slot_latents"],
+            "graph_hidden": encoded["graph_hidden"],
+            "part_mask": encoded["part_mask"],
+            "human_pose_aa_recon": human_pose_aa_recon,
+            "human_root_recon": human_root_recon,
+        }
+        if spectral_aux_pred is not None:
+            out["spectral_aux_pred"] = spectral_aux_pred
+        return out
+
+    def load_teacher(self, checkpoint: str, map_location: str | torch.device = "cpu") -> None:
+        state = torch.load(checkpoint, map_location=map_location, weights_only=False)
+        self.frame_model.load_state_dict(state)

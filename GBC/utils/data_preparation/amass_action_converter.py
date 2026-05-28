@@ -7,7 +7,6 @@ from GBC.utils.data_preparation.data_preparation_cfg import *
 from torchaudio_filters import LowPass
 from tqdm import tqdm
 from GBC.utils.base.math_utils import rot_mat_to_vec, rot_vec_to_mat, quaternion_to_angle_axis, find_longest_cyclic_subsequence, angle_axis_to_quaternion, batch_angle_axis_to_ypr, interpolate_trans, pad_to_len, filt_feet_contact, hampel_filter, quat_inv, quat_conjugate, quat_rotate, q_mul, quat_rotate_inverse, quat_fix, unwrap_and_smooth_rot_vecs, smooth_quat_savgol, batch_rot_vec_to_mat
-from GBC.utils.base.rotation_repair import repair_rotation_sequence
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import numpy as np

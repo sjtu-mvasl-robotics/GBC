@@ -369,13 +369,13 @@ class SMPLHFitter:
             
 if __name__ == "__main__":
     device = 'cuda'
-    smplh_model_path = "/home/yifei/dataset/smplh/male/model.npz"
-    dmpls_model_path = "/home/yifei/dataset/dmpls/male/model.npz"
-    urdf_path = "/home/yifei/dataset/unitree_ros/robots/h1_2_description/h1_2.urdf"
+    smplh_model_path = "/cpfs/user/yaoyifei/datasets/smplh/male/model.npz"
+    dmpls_model_path = "/cpfs/user/yaoyifei/datasets/dmpls/male/model.npz"
+    urdf_path = "/cpfs/user/yaoyifei/datasets/unitree_ros/robots/h1_2_description/h1_2.urdf"
     fitter = SMPLHFitter(
-        # smplh_model_path="/home/yyf/RobotCodespace/amass/support_data/body_models/smplh/male/model.npz", dmpls_model_path="/home/yyf/RobotCodespace/amass/support_data/body_models/dmpls/male/model.npz",
-        # urdf_path="/home/rl/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf",
-        # urdf_path="/home/yyf/codespace/h1_2_description/h1_2.urdf",
+        # smplh_model_path="/cpfs/user/yaoyifei/codespace/amass/support_data/body_models/smplh/male/model.npz", dmpls_model_path="/cpfs/user/yaoyifei/codespace/amass/support_data/body_models/dmpls/male/model.npz",
+        # urdf_path="/cpfs/user/yaoyifei/codespace/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf",
+        # urdf_path="/cpfs/user/yaoyifei/codespace/h1_2_description/h1_2.urdf",
         smplh_model_path=smplh_model_path,
         dmpls_model_path=dmpls_model_path,
         urdf_path=urdf_path,
@@ -473,11 +473,11 @@ if __name__ == "__main__":
     # fitter.visualize_all_23_joints()
     # fitter.fit(max_iter=10000, verbose=True, lr=0.01, offset_map=offset_map, rotation_map=rotation_map)
     fitter.fit(max_iter=0, verbose=True, lr=0.01, offset_map=offset_map, rotation_map=rotation_map, t_pose_action=t_pose_action, joint_weights=joint_weights)
-    fitter.load_fit_result(path="/home/yifei/codespace/GBC_45/checkpoints/smplh_checkpoint_iter_140000.pt")
+    fitter.load_fit_result(path="/cpfs/user/yaoyifei/codespace/gbc/GBC/checkpoints/smplh_checkpoint_iter_140000.pt")
     fitter.visualize_open3d()
     #fitter.visualize_open3d_tpose()
 
-    # fitter.save_fit_result(path="/home/yifei/codespace/GBC_45/checkpoints/smplh_checkpoint_iter_140000.pt")
+    # fitter.save_fit_result(path="/cpfs/user/yaoyifei/codespace/gbc/GBC/checkpoints/smplh_checkpoint_iter_140000.pt")
     #fitter.visualize_all_23_joints()
 
     fitter.visualize_fit_model()

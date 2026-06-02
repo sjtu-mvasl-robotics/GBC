@@ -2,9 +2,17 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from GBC.utils.data_preparation.pose_transformer import PoseTransformer
 from GBC.utils.data_preparation.temporal_modules import CausalConvTemporalEncoder
+from GBC.utils.data_preparation.block_causal_compress import (
+    BlockCausalRoPELayer,
+    BlockCausalUpsampler,
+    BlockCompressor,
+    build_block_causal_mask,
+    pick_num_heads,
+)
 from GBC.utils.data_preparation.spectral_modules import (
     MultiStreamSpectralAuxiliaryHead,
 )
@@ -515,6 +523,8 @@ class GraphTemporalEncoder(nn.Module):
         dropout: float = 0.1,
         per_slot_temporal: bool = False,
         root_global_hub: bool = True,
+        causal: bool = False,
+        block_size: int = 1,
     ):
         super().__init__()
         self.slots = tuple(slots)
@@ -526,20 +536,46 @@ class GraphTemporalEncoder(nn.Module):
         # T*num_slots attention blends e.g. leg@t' into arm@t, defeating the
         # per-slot latent locality the structured decoder relies on (plan A0).
         self.per_slot_temporal = bool(per_slot_temporal)
+        # Per-instance override of the class-level sentinels so the trainer's
+        # metric logger (getattr(encoder, "is_causal"/"total_lookahead_frames"))
+        # reports the truth: causal => 0 frames of lookahead; bidirectional => -1
+        # ("full window").
+        self.is_causal = bool(causal)
+        self.total_lookahead_frames = 0 if causal else -1
         self.slot_embed = nn.Parameter(torch.randn(1, 1, len(self.slots), d_model) * 0.02)
         self.graph_blocks = nn.ModuleList(
             GraphFuseBlock(d_model, num_heads, self.slots, edges, dropout, root_global_hub=root_global_hub)
             for _ in range(graph_layers)
         )
-        temporal_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.temporal_encoder = nn.TransformerEncoder(temporal_layer, num_layers=temporal_layers)
+        # block_size>1 => block-causal RoPE temporal (the clip-compression path):
+        # bidirectional WITHIN a block, causal ACROSS blocks. RoPE supplies the
+        # position signal inside attention, so this path skips the additive
+        # sinusoidal PE. Graph fusion above is per-frame (no temporal mixing), so
+        # block-causality of the whole encoder is preserved.
+        self.block_size = int(block_size)
+        if self.block_size > 1:
+            if not self.per_slot_temporal:
+                raise ValueError(
+                    "block_size>1 (block-causal compression) requires "
+                    "per_slot_temporal=True (latent_architecture='structured')."
+                )
+            self.is_causal = True
+            self.total_lookahead_frames = self.block_size - 1
+            self.block_temporal_layers = nn.ModuleList(
+                BlockCausalRoPELayer(d_model, num_heads, dropout) for _ in range(temporal_layers)
+            )
+            self.temporal_encoder = None
+        else:
+            self.block_temporal_layers = None
+            temporal_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_model * 4,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.temporal_encoder = nn.TransformerEncoder(temporal_layer, num_layers=temporal_layers)
 
     def forward(self, slot_tokens: torch.Tensor, part_mask: torch.Tensor) -> torch.Tensor:
         batch_size, window, num_slots, d_model = slot_tokens.shape
@@ -547,6 +583,17 @@ class GraphTemporalEncoder(nn.Module):
 
         for block in self.graph_blocks:
             x = block(x, part_mask)
+
+        if self.block_size > 1:
+            # Block-causal RoPE temporal, per slot. RoPE is applied inside
+            # attention => no additive PE. Mask: within-block bidirectional,
+            # across-block causal. window must be divisible by block_size.
+            flat = x.permute(0, 2, 1, 3).reshape(batch_size * num_slots, window, d_model)
+            positions = torch.arange(window, device=x.device)
+            allowed = build_block_causal_mask(window, self.block_size, x.device, allowed_true=True)
+            for layer in self.block_temporal_layers:
+                flat = layer(flat, positions, allowed)
+            return flat.reshape(batch_size, num_slots, window, d_model).permute(0, 2, 1, 3).contiguous()
 
         time_pos = _sinusoidal_position_encoding(window, d_model, x.device, x.dtype)
         x = x + time_pos.view(1, window, 1, d_model)
@@ -556,8 +603,24 @@ class GraphTemporalEncoder(nn.Module):
             # not mask them here (a fully-masked sequence would NaN the softmax) —
             # cross-slot leakage is already blocked by running attention per slot.
             flat = x.permute(0, 2, 1, 3).reshape(batch_size * num_slots, window, d_model)
-            flat = self.temporal_encoder(flat)
+            if self.is_causal:
+                # z_t may only attend to frames <= t. Pass BOTH the explicit
+                # float (-inf/0) mask (hits the SDPA fast path) AND is_causal=True;
+                # per the PyTorch docs, is_causal=True without a mask is a footgun,
+                # and a boolean mask would force the slow path.
+                causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                    window, device=flat.device, dtype=flat.dtype
+                )
+                flat = self.temporal_encoder(flat, mask=causal_mask, is_causal=True)
+            else:
+                flat = self.temporal_encoder(flat)
             return flat.reshape(batch_size, num_slots, window, d_model).permute(0, 2, 1, 3).contiguous()
+        if self.is_causal:
+            raise ValueError(
+                "causal_transformer requires per_slot_temporal=True "
+                "(latent_architecture='structured'). Block-causal masking over the "
+                "flattened (T*num_slots) sequence is not supported."
+            )
         flat = x.reshape(batch_size, window * num_slots, d_model)
         temporal_mask = ~part_mask[:, None, :].expand(batch_size, window, num_slots).reshape(batch_size, window * num_slots)
         flat = self.temporal_encoder(flat, src_key_padding_mask=temporal_mask)
@@ -642,22 +705,29 @@ def _build_robot_dof_edges(
 
 
 class TemporalConvBlock(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, kernel_size: int = 5):
+    def __init__(self, d_model: int, dropout: float = 0.1, kernel_size: int = 5, causal: bool = False):
         super().__init__()
-        padding = kernel_size // 2
+        self.kernel_size = int(kernel_size)
+        self.causal = bool(causal)
+        # Causal: left-pad K-1, conv padding 0 -> output[t] depends only on inputs
+        #   [t-(K-1), ..., t]; the following 1x1 conv preserves causality.
+        # Acausal (default): symmetric padding K//2 -> output[t] sees [t-K//2, t+K//2].
+        # Both keep the time length at T.
+        self.left_pad = (self.kernel_size - 1) if self.causal else 0
+        conv_padding = 0 if self.causal else (self.kernel_size // 2)
         self.norm = nn.LayerNorm(d_model)
-        self.net = nn.Sequential(
-            nn.Conv1d(d_model, d_model * 2, kernel_size=kernel_size, padding=padding),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(d_model * 2, d_model, kernel_size=1),
-            nn.Dropout(dropout),
-        )
+        self.conv1 = nn.Conv1d(d_model, d_model * 2, kernel_size=self.kernel_size, padding=conv_padding)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(d_model * 2, d_model, kernel_size=1)
+        self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, window, num_tokens, d_model = x.shape
         flat = self.norm(x).permute(0, 2, 3, 1).reshape(batch_size * num_tokens, d_model, window)
-        flat = self.net(flat)
+        if self.causal:
+            flat = F.pad(flat, (self.left_pad, 0))
+        flat = self.drop2(self.conv2(self.drop1(self.act(self.conv1(flat)))))
         flat = flat.reshape(batch_size, num_tokens, d_model, window).permute(0, 3, 1, 2)
         return x + flat
 
@@ -769,6 +839,7 @@ class RobotGraphActionDecoder(RobotActionAdapter):
         decoder_context: str = "masked_graph_hidden",
         root_slot_into_arms: bool = True,
         dropout: float = 0.1,
+        temporal_decoder_causal: bool = False,
     ):
         super().__init__()
         self.output_dim = int(output_dim)
@@ -848,7 +919,10 @@ class RobotGraphActionDecoder(RobotActionAdapter):
         self.cross_norm = nn.LayerNorm(d_model)
 
         self.graph_blocks = nn.ModuleList(GraphTokenBlock(d_model, num_heads, dropout) for _ in range(graph_layers))
-        self.temporal_blocks = nn.ModuleList(TemporalConvBlock(d_model, dropout) for _ in range(temporal_layers))
+        self.temporal_blocks = nn.ModuleList(
+            TemporalConvBlock(d_model, dropout, causal=bool(temporal_decoder_causal))
+            for _ in range(temporal_layers)
+        )
         edges = _build_robot_dof_edges(robot_dof_edges, output_dim)
         self.robot_dof_graph_source = "kinematic_tree"
         self.robot_dof_edge_count = len(edges)
@@ -1161,6 +1235,7 @@ class UnifiedLatentRetargeter(nn.Module):
         temporal_dilations: Tuple[int, ...] = (1, 2, 4, 8),
         temporal_num_layers: Optional[int] = None,
         temporal_lookahead_frames: int = 0,
+        block_size: int = 1,
         spectral_aux_enabled: bool = False,
         spectral_aux_substream_dims: Optional[Dict[str, int]] = None,
         spectral_aux_substream_M: Optional[Dict[str, int]] = None,
@@ -1241,6 +1316,11 @@ class UnifiedLatentRetargeter(nn.Module):
                 root_dim=root_dim,
             )
         self.temporal_module = str(temporal_module)
+        self.block_size = int(block_size)
+        # Only set for temporal_module='block_causal_compress' (clip-compression);
+        # None for every other module so the forward can branch on them.
+        self.block_compressor = None
+        self.block_upsampler = None
         encoder_temporal_layers = (
             temporal_layers if temporal_num_layers is None else int(temporal_num_layers)
         )
@@ -1249,7 +1329,7 @@ class UnifiedLatentRetargeter(nn.Module):
         # half of the A0 locality fix (the first is per_slot_temporal). Baseline
         # keeps the legacy star graph (root attends to all slots) unchanged.
         encoder_root_global_hub = self.latent_architecture != "structured"
-        if self.temporal_module == "transformer":
+        if self.temporal_module in {"transformer", "causal_transformer"}:
             self.encoder = GraphTemporalEncoder(
                 d_model=d_model,
                 num_heads=num_heads,
@@ -1262,6 +1342,9 @@ class UnifiedLatentRetargeter(nn.Module):
                 # latent (and the masked decoder context) stay region-local.
                 per_slot_temporal=(self.latent_architecture == "structured"),
                 root_global_hub=encoder_root_global_hub,
+                # E1: causal_transformer keeps the same architecture but masks the
+                # per-slot temporal attention so z_t only sees frames <= t.
+                causal=(self.temporal_module == "causal_transformer"),
             )
         elif self.temporal_module in {"causal_conv", "lookahead_conv"}:
             if self.temporal_module == "causal_conv" and int(temporal_lookahead_frames) != 0:
@@ -1281,10 +1364,40 @@ class UnifiedLatentRetargeter(nn.Module):
                 dropout=dropout,
                 root_global_hub=encoder_root_global_hub,
             )
+        elif self.temporal_module == "block_causal_compress":
+            # SONIC-style temporal compaction: the latent unit is a CLIP of
+            # block_size frames, not a frame. Encoder is block-causal (bidir
+            # within block, causal across); the K=T/block_size clip tokens are
+            # the VAE bottleneck; an upsampler expands z back to per-frame.
+            if self.latent_architecture != "structured":
+                raise ValueError("block_causal_compress requires latent_architecture='structured'.")
+            if self.block_size <= 1:
+                raise ValueError("block_causal_compress requires block_size > 1.")
+            self.encoder = GraphTemporalEncoder(
+                d_model=d_model,
+                num_heads=num_heads,
+                slots=self.slots,
+                edges=edges,
+                graph_layers=graph_layers,
+                temporal_layers=encoder_temporal_layers,
+                dropout=dropout,
+                per_slot_temporal=True,
+                root_global_hub=encoder_root_global_hub,
+                block_size=self.block_size,
+            )
+            # Compress per-frame hidden (B,T,S,D) -> clip tokens (B,K,S,D) in
+            # d_model space; mu/logvar then produce the K-token latent z_clip.
+            self.block_compressor = BlockCompressor(d_model, self.block_size)
+            # Decompress sampled z_clip (B,K,S,slot_z) -> per-frame z (B,T,S,slot_z),
+            # block-causally. Heads sized so RoPE head_dim stays even for slot_z.
+            up_heads = pick_num_heads(self.slot_z, prefer=num_heads)
+            self.block_upsampler = BlockCausalUpsampler(
+                self.slot_z, up_heads, self.block_size, dropout=dropout
+            )
         else:
             raise ValueError(
-                f"Unknown temporal_module: {self.temporal_module}. "
-                "Choose from: transformer, causal_conv, lookahead_conv."
+                f"Unknown temporal_module: {self.temporal_module}. Choose from: "
+                "transformer, causal_transformer, causal_conv, lookahead_conv, block_causal_compress."
             )
         self.slot_projector = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -1321,6 +1434,9 @@ class UnifiedLatentRetargeter(nn.Module):
                 decoder_context=str(decoder_context),
                 root_slot_into_arms=bool(decoder_root_slot_into_arms),
                 dropout=dropout,
+                # E1: decoder temporal Conv1d becomes left-pad causal so the
+                # decoder cannot peek at future frames either.
+                temporal_decoder_causal=(self.temporal_module == "causal_transformer"),
             )
         else:
             self.latent_action_decoder = RetargetDecoder(
@@ -1466,9 +1582,17 @@ class UnifiedLatentRetargeter(nn.Module):
             slot_tokens, part_mask = self.tokenizer(pose_aa, root_features, beta, part_mask)
         graph_hidden = self.encoder(slot_tokens, part_mask)
         if self.latent_architecture == "structured":
-            # Per-slot mu/logvar straight off graph_hidden: (B, T, S, slot_z).
-            mu = self.mu_head_slot(graph_hidden)
-            logvar = self.logvar_head_slot(graph_hidden)
+            if self.block_compressor is not None:
+                # block_causal_compress: compress per-frame hidden (B,T,S,D) into
+                # K=T/block_size clip tokens, then bottleneck on the CLIP tokens.
+                # mu/logvar are (B, K, S, slot_z) — the compressed latent. The
+                # upsampler in forward() expands sampled z back to per-frame.
+                hidden_for_latent = self.block_compressor(graph_hidden)
+            else:
+                # Per-slot mu/logvar straight off graph_hidden: (B, T, S, slot_z).
+                hidden_for_latent = graph_hidden
+            mu = self.mu_head_slot(hidden_for_latent)
+            logvar = self.logvar_head_slot(hidden_for_latent)
         else:
             pooled = _masked_mean(graph_hidden, part_mask[:, None, :], dim=2)
             mu = self.mu_head(pooled)
@@ -1522,17 +1646,28 @@ class UnifiedLatentRetargeter(nn.Module):
             sample = self.training
         z_full = self.reparameterize(encoded["mu"], encoded["logvar"], sample=sample)
         if self.latent_architecture == "structured":
-            # z_full is per-slot (B, T, S, slot_z). The routed decoder consumes the
-            # per-slot tensor; everything else (and output["z"]) uses the flattened
-            # z_global (B, T, S*slot_z).
-            z_slots = z_full
-            z = z_full.reshape(batch_size, window, -1)
+            if self.block_upsampler is not None:
+                # block_causal_compress: z_full is the CLIP latent (B, K, S, slot_z).
+                # Decompress block-causally to per-frame z_slots (B, T, S, slot_z).
+                # Option (a): the K clip tokens are the SOLE information channel, so
+                # the decoder gets NO per-frame context — feeding the per-frame
+                # graph_hidden would bypass the bottleneck and void the test.
+                z_slots = self.block_upsampler(z_full)
+                decoder_context = None
+                decoder_context_mask = None
+            else:
+                # z_full is per-slot (B, T, S, slot_z). The routed decoder consumes
+                # the per-slot tensor; output["z"] uses the flattened z_global.
+                z_slots = z_full
+                decoder_context = encoded["graph_hidden"]
+                decoder_context_mask = encoded["part_mask"]
+            z = z_slots.reshape(batch_size, window, -1)
             latent_actions = self.latent_action_decoder(
                 z_slots,
                 beta,
                 robot_id=robot_id,
-                context=encoded["graph_hidden"],
-                context_mask=encoded["part_mask"],
+                context=decoder_context,
+                context_mask=decoder_context_mask,
             )
         else:
             z = z_full

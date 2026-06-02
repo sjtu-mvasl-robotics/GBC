@@ -62,7 +62,7 @@ class TurinV3RoughPPORunnerCfg(RslRlRefOnPolicyRunnerCfg):
         num_heads=8,
         init_noise_std=1.0,
         load_dagger=False,
-        # load_dagger_path="/home/yifei/codespace/GBC_45/logs/rsl_rl/h1_dagger_V2/2025-06-02_10-42-19_h1_imitation/model_8100.pt",
+        # load_dagger_path="/cpfs/user/yaoyifei/codespace/gbc/GBC/logs/rsl_rl/h1_dagger_V2/2025-06-02_10-42-19_h1_imitation/model_8100.pt",
         apply_mlp_residual=False,
         history_length=GLOBAL_HISTORY_LENGTH,
         concatenate_term_names={
@@ -73,7 +73,7 @@ class TurinV3RoughPPORunnerCfg(RslRlRefOnPolicyRunnerCfg):
             "policy":[],
             "critic":[],
         },
-        # load_actor_path="/home/yifei/dataset/save_models/model_stand_v1.pt"
+        # load_actor_path="/cpfs/user/yaoyifei/datasets/save_models/model_stand_v1.pt"
     )
     algorithm = RslRlRefPpoAlgorithmCfg(
         class_name="MMPPO",

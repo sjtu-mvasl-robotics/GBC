@@ -471,7 +471,7 @@ class PoseFormerTrainer:
             optimizer (torch.optim.Optimizer): Optimizer for encoder
             decoder_optimizer (Optional[torch.optim.Optimizer]): Optimizer for decoder
         '''
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, weights_only=False)
         self.model.load_state_dict(checkpoint['model'])
         if optimizer is not None:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -482,6 +482,28 @@ class PoseFormerTrainer:
             self.decoder.load_state_dict(checkpoint['decoder'])
             if decoder_optimizer is not None and 'decoder_optimizer' in checkpoint:
                 decoder_optimizer.load_state_dict(checkpoint['decoder_optimizer'])
+
+    def _save_training_checkpoint(self, optimizer: torch.optim.Optimizer, epoch_label: Union[int, str]) -> str:
+        save_dir = f'{self.save_dir}/models'
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        date = time.strftime("%d_%H_%M")
+        save_path = f'{save_dir}/{date}_epoch_{epoch_label}.pt'
+        self.save(save_path, optimizer=optimizer)
+        self.last_checkpoint = save_path
+        return save_path
+
+    def _save_decoder_checkpoint(self, encoder_optimizer: torch.optim.Optimizer, decoder_optimizer: torch.optim.Optimizer, epoch_label: Union[int, str]) -> str:
+        save_dir = f'{self.save_dir}/models'
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        date = time.strftime("%d_%H_%M")
+        save_path = f'{save_dir}/decoder_{date}_epoch_{epoch_label}.pt'
+        self.save(save_path, optimizer=encoder_optimizer, decoder_optimizer=decoder_optimizer)
+        self.last_checkpoint = save_path
+        return save_path
 
     def create_model_input(self, pose_body: torch.Tensor, pose_hand: torch.Tensor = None, trans: torch.Tensor = None, override_root_orient: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         '''
@@ -1104,15 +1126,16 @@ class PoseFormerTrainer:
                     **kwargs
                 )
 
+            self.last_epoch = epoch + 1
+
             if epoch % save_interval == 0:
-                save_dir = f'{self.save_dir}/models'
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                
-                date = time.strftime("%d_%H_%M")
-                self.save(f'{save_dir}/{date}_epoch_{epoch}.pt', optimizer=optimizer)
+                self._save_training_checkpoint(optimizer, epoch)
 
             scheduler.step()
+
+        if self.last_epoch >= epochs:
+            final_checkpoint = self._save_training_checkpoint(optimizer, f"{self.last_epoch}_final")
+            print(f"Final checkpoint saved: {final_checkpoint}")
             
         # Finish logging
         self.logger.finish()
@@ -1577,23 +1600,21 @@ class PoseFormerTrainer:
                     **kwargs
                 )
             
+            self.last_epoch = epoch + 1
+
             # Save checkpoint
             if epoch % save_interval == 0:
-                save_dir = f'{self.save_dir}/models'
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                
-                date = time.strftime("%d_%H_%M")
                 # Need a dummy encoder optimizer for save function
                 dummy_encoder_opt = torch.optim.AdamW(self.model.parameters())
-                self.save(
-                    f'{save_dir}/decoder_{date}_epoch_{epoch}.pt',
-                    optimizer=dummy_encoder_opt,
-                    decoder_optimizer=decoder_optimizer
-                )
+                self._save_decoder_checkpoint(dummy_encoder_opt, decoder_optimizer, epoch)
                 print(f"✓ Saved decoder checkpoint at epoch {epoch}")
             
             decoder_scheduler.step()
+
+        if self.last_epoch >= epochs:
+            dummy_encoder_opt = torch.optim.AdamW(self.model.parameters())
+            final_checkpoint = self._save_decoder_checkpoint(dummy_encoder_opt, decoder_optimizer, f"{self.last_epoch}_final")
+            print(f"Final decoder checkpoint saved: {final_checkpoint}")
         
         # Restore encoder state if it was frozen
         if freeze_encoder:
@@ -1822,7 +1843,7 @@ if __name__ == "__main__":
 
     smplh_model_path=DATA_PATHS.smplh_model_path
     dmpls_model_path=DATA_PATHS.dmpls_model_path
-    # urdf_path="/home/rl/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf"
+    # urdf_path="/cpfs/user/yaoyifei/codespace/TurinHumanoid/TurinHumanoidV2/robot_model/full_dof/urdf/full_dof_al_v2.urdf"
     urdf_path=DATA_PATHS.urdf_path
     dataset_path=DATA_PATHS.dataset_path
     # smpl_fits_dir=DATA_PATHS.smplh_fit_result_path

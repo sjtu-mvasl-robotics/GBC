@@ -186,6 +186,7 @@ class CachedTargetLinkKinematics(nn.Module):
         root_trans_offset: Optional[torch.Tensor] = None,
         root_rot: Optional[torch.Tensor] = None,
         link_trans_offset: Optional[dict[str, torch.Tensor]] = None,
+        return_full: bool = False,
     ) -> torch.Tensor:
         if dof_pos.dim() != 2:
             raise ValueError("dof_pos must be a 2D tensor.")
@@ -237,7 +238,11 @@ class CachedTargetLinkKinematics(nn.Module):
             rotations[cached.child] = child_R
             translations[cached.child] = child_t
 
-        return torch.stack([translations[name] for name in self.target_links], dim=1)
+        pos_out = torch.stack([translations[name] for name in self.target_links], dim=1)
+        if not return_full:
+            return pos_out
+        rot_out = torch.stack([rotations[name] for name in self.target_links], dim=1)
+        return pos_out, rot_out
 
 
 def make_cached_target_fk_from_mujica_cfg(

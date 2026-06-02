@@ -24,7 +24,7 @@ from GBC.utils.base import PROJECT_ROOT_DIR
 ##
 GR1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"/home/yifei/codespace/GBC_45/robots_usd/fourier_gr1.usd",
+        usd_path=f"/cpfs/user/yaoyifei/codespace/gbc/GBC/robots_usd/fourier_gr1.usd",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,

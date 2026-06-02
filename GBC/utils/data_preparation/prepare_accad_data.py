@@ -150,9 +150,9 @@ def process(file_path, feet_percentile=50, feet_coeff=1):
 
     
 if __name__ == '__main__':
-    amass_accad_path = "/home/yifei/dataset/amass/ACCAD"
-    accad_bvh_path = "/home/yifei/dataset/accad/bvh"
-    save_path = "/home/yifei/dataset/amass_accad_data/ACCAD"
+    amass_accad_path = "/cpfs/user/yaoyifei/datasets/amass/ACCAD"
+    accad_bvh_path = "/cpfs/user/yaoyifei/datasets/accad/bvh"
+    save_path = "/cpfs/user/yaoyifei/datasets/amass_accad_data/ACCAD"
 
     for file in tqdm(glob.glob(os.path.join(amass_accad_path, "**", "B3 - walk1_poses.npz"), recursive=True)):
         file_prefix = file[:-len("_poses.npz")]

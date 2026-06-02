@@ -87,7 +87,7 @@ class PoseRenderer:
     def load_poseformer(self, poseformer_model_path: str, device: str):
         self.poseformer = PoseTransformer(num_actions=self.fk.num_dofs)
         self.poseformer.to(device)
-        self.poseformer.load_state_dict(torch.load(poseformer_model_path, map_location=device))
+        self.poseformer.load_state_dict(torch.load(poseformer_model_path, map_location=device, weights_only=False))
 
     def get_pose_amass(self, pose_body: torch.Tensor, pose_hand: Optional[torch.Tensor] = None, add_smpl_fits: bool = True):
         root_orient = R.from_quat([0, 0, 0, 1]).as_rotvec()
@@ -377,22 +377,22 @@ if __name__ == "__main__":
     
     
                     
-    smplh_model_path="/home/rl/sjtu/data/smplh/male/model.npz"
+    smplh_model_path="/cpfs/user/yaoyifei/datasets/smplh/male/model.npz"
     # smplh_model_path="../../../data/smplh/male/model.npz"
-    dmpls_model_path="/home/rl/sjtu/data/dmpls/male/model.npz"
+    dmpls_model_path="/cpfs/user/yaoyifei/datasets/dmpls/male/model.npz"
     # dmpls_model_path="../../../data/dmpls/male/model.npz"
-    urdf_path="/home/rl/unitree_ros/robots/h1_2_description/h1_2.urdf"
+    urdf_path="/cpfs/user/yaoyifei/datasets/unitree_ros/robots/h1_2_description/h1_2.urdf"
     # urdf_path="../../../data/turing_model/full_dof/urdf/full_dof_al_v2.urdf"
-    dataset_path='/home/rl/sjtu/data/amass'
+    dataset_path='/cpfs/user/yaoyifei/datasets/amass'
     # dataset_path='../../../data/amass'
-    smpl_fits_dir="/home/rl/sjtu/GBC/best_fit.pt"
+    smpl_fits_dir="/cpfs/user/yaoyifei/codespace/gbc/GBC/best_fit.pt"
     # smpl_fits_dir = '../../best_fit.pt'
     # device = 'cpu'
     device = 'cuda'
 
     poseformer_model_path = "fit_h1_2/models/30_10_49_epoch_270.pt"
     # poseformer_model_path = "./models/15_17_56_epoch_20.pt"
-    save_path = "/home/rl/sjtu/RobotCodespace/GBC/rendered_videos"
+    save_path = "/cpfs/user/yaoyifei/codespace/gbc/GBC/rendered_videos"
     # save_path = "rendered_videos"
 
     renderer = PoseRenderer(

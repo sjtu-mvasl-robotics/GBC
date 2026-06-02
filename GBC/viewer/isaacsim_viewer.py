@@ -3,16 +3,16 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses.pkl"
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses_flipped.pkl"
-# default_pkl = "/home/yifei/codespace/GBC_45/output/h1_2/unitree_rt/walk1_subject1.pkl"
-default_pkl = "/home/yifei/dataset/humanoid_converted_actions_openloong/Eyes_Japan_Dataset/takiguchi/greeting-07-bow-takiguchi_poses.pkl"
+# default_pkl = "/cpfs/user/yaoyifei/codespace/gbc/GBC/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses.pkl"
+# default_pkl = "/cpfs/user/yaoyifei/codespace/gbc/GBC/output/h1_2/converted_actions/ACCAD/Female1Walking_c3d/B3 - walk1_poses_flipped.pkl"
+# default_pkl = "/cpfs/user/yaoyifei/codespace/gbc/GBC/output/h1_2/unitree_rt/walk1_subject1.pkl"
+default_pkl = "/cpfs/user/yaoyifei/datasets/humanoid_converted_actions_openloong/Eyes_Japan_Dataset/takiguchi/greeting-07-bow-takiguchi_poses.pkl"
 parser = argparse.ArgumentParser(description="Tutorial on using the interactive scene interface.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
 parser.add_argument("--pkl", type=str, default=default_pkl)
-# parser.add_argument("--urdf", type=str, default="/home/yifei/dataset/unitree_ros/robots/h1_2_description/h1_2.urdf")
-parser.add_argument("--urdf", type=str, default="/home/yifei/dataset/unitree_ros/robots/g1_description/g1_29dof.urdf")
-# parser.add_argument("--urdf", type=str, default="/home/yifei/dataset/some_urdfs/Wiki-GRx-Models/GRX/GR1/GR1T2/urdf/GR1T2_nohand.urdf")
+# parser.add_argument("--urdf", type=str, default="/cpfs/user/yaoyifei/datasets/unitree_ros/robots/h1_2_description/h1_2.urdf")
+parser.add_argument("--urdf", type=str, default="/cpfs/user/yaoyifei/datasets/unitree_ros/robots/g1_description/g1_29dof.urdf")
+# parser.add_argument("--urdf", type=str, default="/cpfs/user/yaoyifei/datasets/some_urdfs/Wiki-GRx-Models/GRX/GR1/GR1T2/urdf/GR1T2_nohand.urdf")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 

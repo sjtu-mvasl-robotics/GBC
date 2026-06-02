@@ -474,8 +474,8 @@ G1_CFG = ArticulationCfg(
 
 G1_29DOF_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"/home/yifei/codespace/GBC_45/robots_usd/unitee_g1.usd",
-        # usd_path="/home/yifei/dataset/unitree_ros/g1_29dof_urdf.usd",
+        usd_path=f"/cpfs/user/yaoyifei/codespace/gbc/GBC_MUJICA/unitee_g1.usd",
+        # usd_path="/cpfs/user/yaoyifei/datasets/unitree_ros/g1_29dof_urdf.usd",
         activate_contact_sensors=True,
          rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,

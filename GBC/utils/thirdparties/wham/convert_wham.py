@@ -9,7 +9,7 @@ class WHAMConverter:
         self.load_hands = cfg.load_hands
         self.fk = RobotKinematics(cfg.urdf_path, device=cfg.device)
         self.model = PoseTransformer(num_actions=self.fk.num_dofs, load_hands=cfg.load_hands).to(cfg.device)
-        self.model.load_state_dict(torch.load(cfg.pose_transformer_path, map_location=torch.device(cfg.device)))
+        self.model.load_state_dict(torch.load(cfg.pose_transformer_path, map_location=torch.device(cfg.device), weights_only=False))
         self.post_process = TrackingDataPostProcess(filter_cfg=cfg.filter).to(cfg.device)
         self.batch_size = cfg.batch_size
         self.device = cfg.device
@@ -243,10 +243,10 @@ if __name__ == "__main__":
     import yaml
     # get parser args
     parser = argparse.ArgumentParser(description="Convert WHAM data to GBC format")
-    parser.add_argument("--wham_path", type=str, default="/home/yifei/codespace/WHAM/vdo/zhiyin", help="Path to WHAM data folder")
-    # parser.add_argument("--tracking_path", type=str, default="/home/yifei/codespace/WHAM/vdo/test/test/tracking_results.pth", help="Path to WHAM tracking data file")
+    parser.add_argument("--wham_path", type=str, default="/cpfs/user/yaoyifei/codespace/WHAM/vdo/zhiyin", help="Path to WHAM data folder")
+    # parser.add_argument("--tracking_path", type=str, default="/cpfs/user/yaoyifei/codespace/WHAM/vdo/test/test/tracking_results.pth", help="Path to WHAM tracking data file")
     parser.add_argument("--export_path", type=str, default="export/zhiyin", help="Path to export converted GBC data")
-    parser.add_argument("--config_path", type=str, default="/home/yifei/codespace/GBC_DP/GBC_MUJICA/data_preparation/humanoid_cfg/unitree_g1.yaml", help="Path to config file")
+    parser.add_argument("--config_path", type=str, default="/cpfs/user/yaoyifei/codespace/gbc/GBC_MUJICA/GBC_MUJICA/data_preparation/humanoid_cfg/unitree_g1.yaml", help="Path to config file")
     
     args = parser.parse_args()
     

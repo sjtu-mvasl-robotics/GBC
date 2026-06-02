@@ -118,7 +118,7 @@ class UnitreeG1RoughRefPPORunnerCfg(RslRlRefOnPolicyRunnerCfg):
         init_noise_std=1.0,
         load_dagger=False,
         apply_rope=True,
-        # load_dagger_path="/home/yifei/codespace/GBC_45/logs/rsl_rl/h1_dagger_V2/2025-06-02_10-42-19_h1_imitation/model_8100.pt",
+        # load_dagger_path="/cpfs/user/yaoyifei/codespace/gbc/GBC/logs/rsl_rl/h1_dagger_V2/2025-06-02_10-42-19_h1_imitation/model_8100.pt",
         apply_mlp_residual=False,
         history_length=GLOBAL_HISTORY_LENGTH,
         concatenate_term_names={
@@ -129,7 +129,7 @@ class UnitreeG1RoughRefPPORunnerCfg(RslRlRefOnPolicyRunnerCfg):
             "policy":[["lft_sin_phase", "lft_cos_phase", "rht_sin_phase", "rht_cos_phase"], ["target_actions", "target_actions_t1", "target_actions_t2", "target_actions_t3"], ["target_quaternion","target_quaternion_t1", "target_quaternion_t2", "target_quaternion_t3"]],
             "critic":[["lft_sin_phase", "lft_cos_phase", "rht_sin_phase", "rht_cos_phase"],["target_actions", "target_actions_t1", "target_actions_t2", "target_actions_t3"], ["target_quaternion","target_quaternion_t1", "target_quaternion_t2", "target_quaternion_t3"]],
         },
-        # load_actor_path="/home/yifei/codespace/GBC_45/logs/rsl_rl/UnitreeG1_flat/2025-10-02_19-47-03_UnitreeG1_imitation/model_5500.pt"
+        # load_actor_path="/cpfs/user/yaoyifei/codespace/gbc/GBC/logs/rsl_rl/UnitreeG1_flat/2025-10-02_19-47-03_UnitreeG1_imitation/model_5500.pt"
     )
     algorithm = RslRlRefPpoAlgorithmCfg(
         class_name="MMPPO",

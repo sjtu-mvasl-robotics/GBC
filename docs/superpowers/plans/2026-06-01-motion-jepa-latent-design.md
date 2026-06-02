@@ -131,10 +131,13 @@ Make the single JEPA predictor also predict **future-frame** latents (add causal
 
 ## 9. Open items / conflicts to resolve before plans
 
-1. **§3.5 temporal-module placement** — per-joint-temporal (recommended) vs pre-temporal target. Sets the encoder refactor scope.
-2. **`graph_layers` conflict:** Plan 1's ADDENDUM sets MFME `graph_layers=1` (locality); the 2026-06-01 grid (`locality-grid-results`) says **keep `graph_layers=2`** — glayers=1 regressed `mean_l2_m` +2.2% with no compensating locality gain. These contradict. The grid was on the slot-level structured path; per-joint JEPA (§3.2) changes the regime, so the result may not transfer. **Resolve which wins for the JEPA encoder** before implementing.
-3. **Latent dim D** — the grid used a 336-dim per-frame z (`locality-grid-results`); B1's FM backbone defaults `latent_dim=256` (its transformer width, independent of D). Pick D and confirm B1 I/O Linear dims.
-4. **Mask-ratio band** for 21 joints (§3.3) — sweep target.
+> **Items 1–3 RESOLVED 2026-06-02** by grounding Stage 1 in the D4 baseline (`gbc_runs/_d4_config`). See `2026-06-02-jepa-stage1-implementation.md`.
+
+1. **§3.5 temporal-module placement** — RESOLVED: **option (i) per-joint-temporal** (a `JointTemporalEncoder` before pooling), required for V-JEPA-faithful "mask joints, full temporal info visible." Stage-1 Fork B.
+2. **`graph_layers` conflict** — RESOLVED: **`graph_layers=2`** (D4 uses 2; matches `locality-grid-results`). The Plan-1 addendum's `=1` is rejected.
+3. **Latent dim D** — RESOLVED: **D = 336** (D4's structured `slot_z=48 × 7 slots`). B1's FM backbone `latent_dim` (its transformer width) stays independent; B1 I/O Linears map `336 ↔ latent_dim`.
+4. **Mask-ratio band** for 21 joints (§3.3) — sweep target 0.4–0.7 (open hyperparameter).
+5. **NEW — Fork A (encoder inputs):** add velocity + contact channels (physics-extendability) vs match D4's `none`. Recommended: add. See Stage-1 §3.
 
 ---
 

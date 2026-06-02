@@ -1,5 +1,7 @@
 # Motion-JEPA Module + Synthetic Smoke Gate — Implementation Plan (Plan 1 of 3)
 
+> **SUPERSEDED 2026-06-02** by `2026-06-02-jepa-stage1-implementation.md`. This plan's slot-level `slot_time_mask` + full-grid refiner and its synthetic-only / MFME framing are replaced by **per-joint** V-JEPA masking, a spatial completion predictor, and an encoder config-matched to the real **D4** baseline (`UnifiedLatentRetargeter` structured). Kept for audit; do not implement from it. The EMA/loss core and the `Task 0` locality intent survive in revised form (note: `graph_layers=2`, not `=1`).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the self-supervised Motion-JEPA module (`slot_time_mask` on MFME, mask generator, EMA target encoder, predictor, feature-prediction loss) and a synthetic non-collapse smoke gate, all without any real-data / GMR dependency.

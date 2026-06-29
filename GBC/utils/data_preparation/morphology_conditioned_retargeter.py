@@ -49,6 +49,7 @@ from GBC.utils.data_preparation.graph_retarget_latent import (
 
 
 URDF_FEATURE_DIM = 21  # matches RobotKinematics.get_dof_features
+SMPLH_FIT_GRAPH_FEATURE_DIM = 10
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,183 @@ class RobotSpec:
 
 
 _SLOT_NAME_TO_INDEX = {name: i for i, name in enumerate(DEFAULT_BODY_SLOTS)}
+
+
+@dataclass
+class SMPLHFitGraphSpec:
+    """Static target-morphology graph derived from one robot's SMPL-H fit."""
+
+    name: str
+    node_features: torch.Tensor       # (22, SMPLH_FIT_GRAPH_FEATURE_DIM)
+    parent_index: torch.Tensor        # (22,) long; -1 = pelvis root
+    slot_assignment: torch.Tensor     # (22,) long
+    hop_matrix: torch.Tensor          # (22, 22) long
+    joint_names: Tuple[str, ...]
+
+    @property
+    def num_joints(self) -> int:
+        return int(self.node_features.shape[0])
+
+    def to(self, device: torch.device | str) -> "SMPLHFitGraphSpec":
+        return SMPLHFitGraphSpec(
+            name=self.name,
+            node_features=self.node_features.to(device),
+            parent_index=self.parent_index.to(device),
+            slot_assignment=self.slot_assignment.to(device),
+            hop_matrix=self.hop_matrix.to(device),
+            joint_names=self.joint_names,
+        )
+
+
+SMPLH_FIT_BODY_NAMES: Tuple[str, ...] = (
+    "Pelvis", "L_Hip", "R_Hip", "Torso", "L_Knee", "R_Knee", "Spine",
+    "L_Ankle", "R_Ankle", "Chest", "L_Toe", "R_Toe", "Neck",
+    "L_Thorax", "R_Thorax", "Head", "L_Shoulder", "R_Shoulder",
+    "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist",
+)
+
+SMPLH_FIT_BODY_PARENTS: Tuple[int, ...] = (
+    -1,  # Pelvis
+    0,  # L_Hip
+    0,  # R_Hip
+    0,  # Torso
+    1,  # L_Knee
+    2,  # R_Knee
+    3,  # Spine
+    4,  # L_Ankle
+    5,  # R_Ankle
+    6,  # Chest
+    7,  # L_Toe
+    8,  # R_Toe
+    9,  # Neck
+    9,  # L_Thorax
+    9,  # R_Thorax
+    12,  # Head
+    13,  # L_Shoulder
+    14,  # R_Shoulder
+    16,  # L_Elbow
+    17,  # R_Elbow
+    18,  # L_Wrist
+    19,  # R_Wrist
+)
+
+
+def _smplh_fit_slot_assignment() -> torch.Tensor:
+    slot = torch.full((len(SMPLH_FIT_BODY_NAMES),), _SLOT_NAME_TO_INDEX["global_root"], dtype=torch.long)
+    for idx, name in enumerate(SMPLH_FIT_BODY_NAMES):
+        if name in {"Torso", "Spine", "Chest", "Neck", "Head", "L_Thorax", "R_Thorax"}:
+            slot[idx] = _SLOT_NAME_TO_INDEX["trunk_head"]
+        elif name.startswith("L_") and any(k in name for k in ("Hip", "Knee", "Ankle", "Toe")):
+            slot[idx] = _SLOT_NAME_TO_INDEX["left_leg"]
+        elif name.startswith("R_") and any(k in name for k in ("Hip", "Knee", "Ankle", "Toe")):
+            slot[idx] = _SLOT_NAME_TO_INDEX["right_leg"]
+        elif name.startswith("L_") and any(k in name for k in ("Thorax", "Shoulder", "Elbow", "Wrist")):
+            slot[idx] = _SLOT_NAME_TO_INDEX["left_arm"]
+        elif name.startswith("R_") and any(k in name for k in ("Thorax", "Shoulder", "Elbow", "Wrist")):
+            slot[idx] = _SLOT_NAME_TO_INDEX["right_arm"]
+    return slot
+
+
+def validate_smplh_fit_graph_path(path: str) -> str:
+    """Reject known deprecated joint-only fit artifacts before graph conditioning."""
+    lower = str(path).lower()
+    if "deprecated" in lower or "joint_only" in lower:
+        raise ValueError(
+            f"deprecated SMPL-H fit is not valid for fit-graph conditioning: {path}"
+        )
+    return str(path)
+
+
+def _fit_value(fit: Dict[str, torch.Tensor], *names: str) -> torch.Tensor:
+    for name in names:
+        if name in fit:
+            return fit[name]
+    raise KeyError(f"fit is missing one of {names}")
+
+
+def _smplh_fit_joints_from_fit(
+    fit: Dict[str, torch.Tensor],
+    body_model,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    beta = _fit_value(fit, "beta", "betas").detach().to(device=device, dtype=torch.float32)
+    dmpls = _fit_value(fit, "dmpls").detach().to(device=device, dtype=torch.float32)
+    scale = _fit_value(fit, "scale").detach().to(device=device, dtype=torch.float32).reshape(-1)[0]
+    out = body_model(betas=beta, dmpls=dmpls)
+    return out.Jtr[0, : len(SMPLH_FIT_BODY_NAMES), :].detach().to(device=device, dtype=torch.float32) * scale
+
+
+def _neutral_smplh_fit_joints(
+    body_model,
+    device: torch.device | str,
+    beta_dim: int,
+    dmpls_dim: int,
+) -> torch.Tensor:
+    beta = torch.zeros(1, int(beta_dim), device=device)
+    dmpls = torch.zeros(1, int(dmpls_dim), device=device)
+    out = body_model(betas=beta, dmpls=dmpls)
+    return out.Jtr[0, : len(SMPLH_FIT_BODY_NAMES), :].detach().to(device=device, dtype=torch.float32)
+
+
+def _bone_vectors_and_lengths(
+    root_relative_joints: torch.Tensor,
+    parents: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    vec = torch.zeros_like(root_relative_joints)
+    valid = parents >= 0
+    vec[valid] = root_relative_joints[valid] - root_relative_joints[parents[valid]]
+    length = vec.norm(dim=-1, keepdim=True)
+    return vec, length
+
+
+def build_smplh_fit_graph_spec(
+    fit: Dict[str, torch.Tensor],
+    body_model,
+    *,
+    name: str = "smplh_fit",
+    device: torch.device | str = "cpu",
+    max_hops: int = 8,
+) -> SMPLHFitGraphSpec:
+    """Build a fixed 22-node SMPL-H body graph from a robot's mesh-anchor fit."""
+    device = torch.device(device)
+    joints = _smplh_fit_joints_from_fit(fit, body_model, device=device)
+    beta = _fit_value(fit, "beta", "betas")
+    dmpls = _fit_value(fit, "dmpls")
+    neutral = _neutral_smplh_fit_joints(
+        body_model, device, beta_dim=beta.shape[-1], dmpls_dim=dmpls.shape[-1],
+    )
+
+    parents = torch.tensor(SMPLH_FIT_BODY_PARENTS, dtype=torch.long, device=device)
+    root_rel = joints - joints[0:1]
+    neutral_root_rel = neutral - neutral[0:1]
+    bone_vec, bone_len = _bone_vectors_and_lengths(root_rel, parents)
+    _neutral_vec, neutral_len = _bone_vectors_and_lengths(neutral_root_rel, parents)
+
+    valid = (parents >= 0).view(-1, 1)
+    ratio = torch.ones_like(bone_len)
+    ratio[valid] = bone_len[valid] / neutral_len[valid].clamp_min(1e-6)
+
+    child_count = torch.zeros(len(SMPLH_FIT_BODY_NAMES), 1, device=device)
+    for parent in SMPLH_FIT_BODY_PARENTS:
+        if parent >= 0:
+            child_count[parent] += 1.0
+    is_root = (parents < 0).to(torch.float32).view(-1, 1)
+    is_leaf = (child_count == 0).to(torch.float32)
+
+    node_features = torch.cat([root_rel, bone_vec, bone_len, ratio, is_root, is_leaf], dim=-1)
+    if node_features.shape[-1] != SMPLH_FIT_GRAPH_FEATURE_DIM:
+        raise RuntimeError(
+            f"SMPL-H fit graph feature dim {node_features.shape[-1]} != {SMPLH_FIT_GRAPH_FEATURE_DIM}"
+        )
+    hop_matrix = _hop_matrix_from_parents(parents.cpu(), max_hops=max_hops).to(device)
+    return SMPLHFitGraphSpec(
+        name=name,
+        node_features=node_features.detach().cpu(),
+        parent_index=parents.detach().cpu(),
+        slot_assignment=_smplh_fit_slot_assignment(),
+        hop_matrix=hop_matrix.detach().cpu(),
+        joint_names=SMPLH_FIT_BODY_NAMES,
+    )
 
 
 def _slot_for_joint_name(name: str) -> int:
@@ -383,6 +561,31 @@ def batch_robot_specs(specs: Sequence[RobotSpec]) -> Dict[str, torch.Tensor]:
         "control_mode": control_mode,
         "parent_index": parent_index,
         "dof_padding_mask": padding,
+    }
+
+
+def batch_smplh_fit_graph_specs(specs: Sequence[SMPLHFitGraphSpec]) -> Dict[str, torch.Tensor]:
+    """Batch fixed SMPL-H fit graphs into robot_batch-compatible tensor fields."""
+    if not specs:
+        raise ValueError("batch_smplh_fit_graph_specs requires at least one spec")
+    j_max = max(s.num_joints for s in specs)
+    b = len(specs)
+    f = specs[0].node_features.shape[1]
+    node_features = torch.zeros(b, j_max, f)
+    slot_assignment = torch.zeros(b, j_max, dtype=torch.long)
+    hop_matrix = torch.full((b, j_max, j_max), 0, dtype=torch.long)
+    padding = torch.ones(b, j_max, dtype=torch.bool)
+    for i, s in enumerate(specs):
+        j = s.num_joints
+        node_features[i, :j] = s.node_features
+        slot_assignment[i, :j] = s.slot_assignment
+        hop_matrix[i, :j, :j] = s.hop_matrix
+        padding[i, :j] = False
+    return {
+        "fit_node_features": node_features,
+        "fit_slot_assignment": slot_assignment,
+        "fit_hop_matrix": hop_matrix,
+        "fit_padding_mask": padding,
     }
 
 
@@ -708,6 +911,92 @@ class MorphologyGraphEncoder(nn.Module):
         )
         full[:, :, 1:, 1:] = pair_b
         return full
+
+
+class SMPLHFitGraphEncoder(nn.Module):
+    """Encode target robot SMPL-H fit graph into joint, slot, and CLS tokens."""
+
+    def __init__(
+        self,
+        feature_dim: int = SMPLH_FIT_GRAPH_FEATURE_DIM,
+        d_model: int = 256,
+        num_heads: int = 8,
+        num_graph_layers: int = 1,
+        max_hops: int = 8,
+        num_slots: int = len(DEFAULT_BODY_SLOTS),
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.max_hops = int(max_hops)
+        self.num_slots = int(num_slots)
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.slot_embed = nn.Embedding(num_slots, d_model)
+        self.hop_bias = nn.Embedding(max_hops + 2, num_heads)
+        self.same_slot_bias = nn.Embedding(2, num_heads)
+        self.layers = nn.ModuleList(
+            GraphormerLayer(d_model, num_heads, dropout) for _ in range(num_graph_layers)
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def _build_attn_bias(
+        self,
+        slot_assignment: torch.Tensor,
+        hop_matrix: torch.Tensor,
+    ) -> torch.Tensor:
+        b, j = slot_assignment.shape
+        hops_clamped = hop_matrix.clamp_max(self.max_hops + 1)
+        hop_b = self.hop_bias(hops_clamped)
+        same_slot = (slot_assignment[:, :, None] == slot_assignment[:, None, :]).long()
+        slot_b = self.same_slot_bias(same_slot)
+        pair_b = (hop_b + slot_b).permute(0, 3, 1, 2)
+        full = torch.zeros(
+            b, self.num_heads, j + 1, j + 1, device=pair_b.device, dtype=pair_b.dtype
+        )
+        full[:, :, 1:, 1:] = pair_b
+        return full
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        slot_assignment: torch.Tensor,
+        hop_matrix: torch.Tensor,
+        fit_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, j, _ = node_features.shape
+        x = self.feature_proj(node_features) + self.slot_embed(slot_assignment)
+        cls = self.cls_token.expand(b, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        if fit_padding_mask is not None:
+            cls_pad = torch.zeros(b, 1, dtype=torch.bool, device=fit_padding_mask.device)
+            key_padding_mask = torch.cat([cls_pad, fit_padding_mask], dim=1)
+        else:
+            key_padding_mask = None
+        if self.layers:
+            attn_bias = self._build_attn_bias(slot_assignment, hop_matrix)
+            for layer in self.layers:
+                x = layer(x, attn_bias=attn_bias, key_padding_mask=key_padding_mask)
+        fit_per_joint = x[:, 1:, :]
+        fit_cls = x[:, 0, :]
+
+        onehot = torch.nn.functional.one_hot(
+            slot_assignment.clamp(0, self.num_slots - 1), num_classes=self.num_slots,
+        ).to(fit_per_joint.dtype)
+        if fit_padding_mask is not None:
+            onehot = onehot * (~fit_padding_mask).to(fit_per_joint.dtype).unsqueeze(-1)
+        slot_sum = torch.einsum("bjd,bjs->bsd", fit_per_joint, onehot)
+        slot_cnt = onehot.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
+        fit_per_slot = slot_sum / slot_cnt
+        return fit_per_joint, fit_per_slot, fit_cls
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1705,10 @@ class MotionLatentRetargeter(nn.Module):
         unified_human_decoder: bool = False,
         robot_encoder_enabled: bool = False,
         root_height_factorized: bool = False,
+        morph_fit_graph: str = "none",          # "none" | "smplh"
+        morph_fit_graph_feature_dim: int = SMPLH_FIT_GRAPH_FEATURE_DIM,
+        morph_fit_graph_layers: int = 1,
+        root_height_source: str = "raw",        # "raw" | "legacy_rest_height" | "learned_fit_graph"
         morph_descriptor_dim: int = 0,
         morph_descriptor_inject: str = "add",     # "add" | "node_aug"
         morph_descriptor_target: str = "both",    # "both" | "cls_only"  (add only)
@@ -1475,6 +1768,9 @@ class MotionLatentRetargeter(nn.Module):
             dropout=dropout,
             num_control_modes=mge_num_control_modes,
         )
+        self.morph_fit_graph = str(morph_fit_graph)
+        if self.morph_fit_graph not in {"none", "smplh"}:
+            raise ValueError(f"Unknown morph_fit_graph: {morph_fit_graph!r}")
         # The MFME may have grown its slot count (e.g. +1 for root_state in
         # per_slot mode). Mirror that into CMAD's cross-attention so the
         # motion-side keys/values count matches.
@@ -1569,6 +1865,13 @@ class MotionLatentRetargeter(nn.Module):
         # Factorized z (z = analytic z_stand × learned modulation) requires the
         # robot_batch to carry "rest_root_height" — see RootDecoder.forward.
         self.root_height_factorized = bool(root_height_factorized)
+        self.root_height_source = str(root_height_source)
+        if self.root_height_source not in {"raw", "legacy_rest_height", "learned_fit_graph"}:
+            raise ValueError(f"Unknown root_height_source: {root_height_source!r}")
+        if self.root_height_factorized and self.root_height_source == "raw":
+            self.root_height_source = "legacy_rest_height"
+        if self.root_height_source == "learned_fit_graph" and self.morph_fit_graph == "none":
+            raise ValueError("root_height_source='learned_fit_graph' requires morph_fit_graph='smplh'")
         self.root_decoder = RootDecoder(
             slot_z=self.slot_z,
             d_model=d_model,
@@ -1576,6 +1879,41 @@ class MotionLatentRetargeter(nn.Module):
             dropout=dropout,
             causal=self.causal,
         )
+        self.fit_graph_encoder = None
+        self.fit_dof_fuser = None
+        self.fit_cls_fuser = None
+        self.fit_stand_height_head = None
+        if self.morph_fit_graph == "smplh":
+            self.fit_graph_encoder = SMPLHFitGraphEncoder(
+                feature_dim=int(morph_fit_graph_feature_dim),
+                d_model=d_model,
+                num_heads=morphology_num_heads,
+                num_graph_layers=int(morph_fit_graph_layers),
+                max_hops=max_hops,
+                num_slots=num_slots,
+                dropout=dropout,
+            )
+            self.fit_dof_fuser = nn.Sequential(
+                nn.LayerNorm(d_model * 2),
+                nn.Linear(d_model * 2, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.fit_cls_fuser = nn.Sequential(
+                nn.LayerNorm(d_model * 2),
+                nn.Linear(d_model * 2, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.fit_stand_height_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, 1),
+            )
+            self._zero_last_linear(self.fit_dof_fuser)
+            self._zero_last_linear(self.fit_cls_fuser)
+            self._init_stand_height_head(self.fit_stand_height_head, initial_height=0.8)
 
         # ----- Morphology descriptor adapter (optional) --------------------
         # Injects a per-robot fit-derived morphology descriptor into the decoder's
@@ -1636,6 +1974,24 @@ class MotionLatentRetargeter(nn.Module):
     def mfme_slots_inferred(slots):
         """Match SkeletalJointTokenizer's behaviour: tuple of strings."""
         return tuple(slots)
+
+    @staticmethod
+    def _zero_last_linear(module: nn.Module) -> None:
+        for submodule in reversed(list(module.modules())):
+            if isinstance(submodule, nn.Linear):
+                nn.init.zeros_(submodule.weight)
+                nn.init.zeros_(submodule.bias)
+                return
+
+    @staticmethod
+    def _init_stand_height_head(module: nn.Module, initial_height: float) -> None:
+        for submodule in reversed(list(module.modules())):
+            if isinstance(submodule, nn.Linear):
+                nn.init.zeros_(submodule.weight)
+                # inverse softplus: log(exp(y) - 1)
+                bias = torch.log(torch.expm1(torch.tensor(float(initial_height)).clamp_min(1e-4)))
+                nn.init.constant_(submodule.bias, float(bias.item()))
+                return
 
     # ------------------------------------------------------------------
     # Aliases for production-trainer attribute compatibility. The trainer's
@@ -1720,7 +2076,7 @@ class MotionLatentRetargeter(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         return self.mfme(pose_aa, root_pose, beta, part_mask, sample=sample)
 
-    def encode_morphology(self, robot_batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_morphology_full(self, robot_batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor | None]:
         # Optional morphology-descriptor injection. `morph_descriptor` is absent for
         # the unified-human spec path -> desc is None -> neutral (the human IS the
         # neutral reference), so that path is unchanged.
@@ -1736,9 +2092,47 @@ class MotionLatentRetargeter(nn.Module):
             dof_padding_mask=robot_batch.get("dof_padding_mask"),
             node_bias=node_bias,
         )
+        fit_per_joint = None
+        fit_per_slot = None
+        fit_cls = None
+        if self.fit_graph_encoder is not None and self.morph_fit_graph != "none":
+            required = ("fit_node_features", "fit_slot_assignment", "fit_hop_matrix")
+            missing = [k for k in required if k not in robot_batch]
+            if missing:
+                raise RuntimeError(
+                    "morph_fit_graph='smplh' requires robot_batch fields "
+                    f"{required}; missing {missing}"
+                )
+            fit_per_joint, fit_per_slot, fit_cls = self.fit_graph_encoder(
+                node_features=robot_batch["fit_node_features"],
+                slot_assignment=robot_batch["fit_slot_assignment"],
+                hop_matrix=robot_batch["fit_hop_matrix"],
+                fit_padding_mask=robot_batch.get("fit_padding_mask"),
+            )
+            assert self.fit_dof_fuser is not None and self.fit_cls_fuser is not None
+            b, k = robot_batch["slot_assignment"].shape
+            d = fit_per_slot.shape[-1]
+            gather_idx = robot_batch["slot_assignment"].clamp(0, fit_per_slot.shape[1] - 1)
+            fit_slot_for_dof = torch.gather(
+                fit_per_slot, 1, gather_idx.unsqueeze(-1).expand(b, k, d)
+            )
+            dof_delta = self.fit_dof_fuser(torch.cat([m_per_dof, fit_slot_for_dof], dim=-1))
+            cls_delta = self.fit_cls_fuser(torch.cat([m_cls, fit_cls], dim=-1))
+            m_per_dof = m_per_dof + dof_delta
+            m_cls = m_cls + cls_delta
         if self.morph_adapter is not None and desc is not None and self.morph_adapter.inject == "add":
             m_per_dof, m_cls = self.morph_adapter.apply_tokens(m_per_dof, m_cls, desc)
-        return m_per_dof, m_cls
+        return {
+            "m_per_dof": m_per_dof,
+            "m_cls": m_cls,
+            "fit_per_joint": fit_per_joint,
+            "fit_per_slot": fit_per_slot,
+            "fit_cls": fit_cls,
+        }
+
+    def encode_morphology(self, robot_batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        morph = self.encode_morphology_full(robot_batch)
+        return morph["m_per_dof"], morph["m_cls"]
 
     def encode_robot(
         self,
@@ -1842,7 +2236,9 @@ class MotionLatentRetargeter(nn.Module):
         encoded = self.encode(pose_aa, root_features, beta=beta, part_mask=part_mask, sample=sample)
 
         rb = self._expand_robot_batch(batch_size, device)
-        m_per_dof, _m_cls = self.encode_morphology(rb)
+        morph = self.encode_morphology_full(rb)
+        m_per_dof = morph["m_per_dof"]
+        _m_cls = morph["m_cls"]
         actions = self.cmad(
             z=encoded["z"],
             slot_hidden=encoded["graph_hidden"],
@@ -1861,15 +2257,32 @@ class MotionLatentRetargeter(nn.Module):
         # ref_base_height. root_xyz: (B, T, 3). `root_height` (the z component)
         # is exposed for the trainer's physics foot loss + logging.
         root_slot_z = encoded["z_slots"][:, :, self.root_state_slot_idx, :]  # (B, T, slot_z)
-        rest_h = rb.get("rest_root_height") if self.root_height_factorized else None
-        if self.root_height_factorized and rest_h is None:
+        fit_stand_height = None
+        if self.root_height_source == "legacy_rest_height":
+            rest_h = rb.get("rest_root_height")
+            if rest_h is None:
+                raise RuntimeError(
+                    "root_height_source='legacy_rest_height' but robot_batch lacks "
+                    "'rest_root_height' (compute it with rest_root_height_from_fk and "
+                    "add it to the batch passed to set_robot_batch)."
+                )
+            root_xyz = self.root_decoder(root_slot_z, _m_cls, rest_root_height=rest_h)
+        elif self.root_height_source == "learned_fit_graph":
+            fit_cls = morph.get("fit_cls")
+            if fit_cls is None or self.fit_stand_height_head is None:
+                raise RuntimeError(
+                    "root_height_source='learned_fit_graph' requires morph_fit_graph='smplh' "
+                    "and fit graph fields in robot_batch."
+                )
+            fit_stand_height = torch.nn.functional.softplus(self.fit_stand_height_head(fit_cls)).clamp_min(1e-4)
+            root_xyz = self.root_decoder(root_slot_z, _m_cls, rest_root_height=fit_stand_height)
+        elif self.root_height_factorized:
             raise RuntimeError(
-                "root_height_factorized=True but robot_batch lacks 'rest_root_height' "
-                "(compute it with rest_root_height_from_fk and add it to the batch "
-                "passed to set_robot_batch) — without it the z head's residual "
-                "output would be misread as an absolute height."
+                "root_height_factorized=True requires root_height_source='legacy_rest_height' "
+                "or root_height_source='learned_fit_graph'."
             )
-        root_xyz = self.root_decoder(root_slot_z, _m_cls, rest_root_height=rest_h)  # (B, T, 3)
+        else:
+            root_xyz = self.root_decoder(root_slot_z, _m_cls, rest_root_height=None)  # (B, T, 3)
         root_height = root_xyz[..., 2:3]  # (B, T, 1)
 
         # AE arm — graph-based human pose reconstruction from z_slots.
@@ -1927,6 +2340,8 @@ class MotionLatentRetargeter(nn.Module):
             "human_pose_aa_recon": human_pose_aa_recon,
             "human_root_recon": human_root_recon,
         }
+        if fit_stand_height is not None:
+            out["fit_stand_height"] = fit_stand_height
         return out
 
 

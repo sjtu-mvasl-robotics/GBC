@@ -2076,7 +2076,12 @@ class MotionLatentRetargeter(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         return self.mfme(pose_aa, root_pose, beta, part_mask, sample=sample)
 
-    def encode_morphology_full(self, robot_batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor | None]:
+    def encode_morphology_full(
+        self,
+        robot_batch: Dict[str, torch.Tensor],
+        *,
+        use_fit_graph: bool = True,
+    ) -> Dict[str, torch.Tensor | None]:
         # Optional morphology-descriptor injection. `morph_descriptor` is absent for
         # the unified-human spec path -> desc is None -> neutral (the human IS the
         # neutral reference), so that path is unchanged.
@@ -2095,7 +2100,7 @@ class MotionLatentRetargeter(nn.Module):
         fit_per_joint = None
         fit_per_slot = None
         fit_cls = None
-        if self.fit_graph_encoder is not None and self.morph_fit_graph != "none":
+        if use_fit_graph and self.fit_graph_encoder is not None and self.morph_fit_graph != "none":
             required = ("fit_node_features", "fit_slot_assignment", "fit_hop_matrix")
             missing = [k for k in required if k not in robot_batch]
             if missing:
@@ -2130,8 +2135,13 @@ class MotionLatentRetargeter(nn.Module):
             "fit_cls": fit_cls,
         }
 
-    def encode_morphology(self, robot_batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        morph = self.encode_morphology_full(robot_batch)
+    def encode_morphology(
+        self,
+        robot_batch: Dict[str, torch.Tensor],
+        *,
+        use_fit_graph: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        morph = self.encode_morphology_full(robot_batch, use_fit_graph=use_fit_graph)
         return morph["m_per_dof"], morph["m_cls"]
 
     def encode_robot(
@@ -2297,7 +2307,7 @@ class MotionLatentRetargeter(nn.Module):
         z_slots = encoded["z_slots"]  # raises KeyError if not in per_slot mode
         if self.unified_human_decoder:
             human_batch = self._expand_human_spec(batch_size, device)
-            m_human, _ = self.encode_morphology(human_batch)
+            m_human, _ = self.encode_morphology(human_batch, use_fit_graph=False)
             x_human = self.cmad.decode_features(
                 z=encoded["z"],
                 slot_hidden=encoded["graph_hidden"],

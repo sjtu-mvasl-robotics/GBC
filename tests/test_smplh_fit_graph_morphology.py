@@ -187,7 +187,17 @@ def test_learned_fit_graph_root_height_runs_without_rest_root_height():
     assert (out["fit_stand_height"] > 0).all()
 
 
+def test_fit_graph_does_not_block_unified_human_decoder():
+    model = _tiny_model(morph_fit_graph="smplh", unified_human_decoder=True)
+    model.set_robot_batch(_robot_batch_with_fit_graph(scale=1.0))
+    pose, root, beta = _tiny_motion()
+
+    out = model(pose_body=pose, root_features=root, beta=beta, sample=False)
+
+    assert out["human_pose_aa_recon"].shape == (pose.shape[0], pose.shape[1], 21, 3)
+    assert out["human_root_recon"].shape == root.shape
+
+
 def test_deprecated_fit_path_is_rejected():
     with pytest.raises(ValueError, match="deprecated"):
         validate_smplh_fit_graph_path("/tmp/deprecated/smplh_fit_DEPRECATED.pt")
-

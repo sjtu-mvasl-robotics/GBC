@@ -49,3 +49,7 @@ GBC/viewer/isaacsim_viewer_record.py
 GBC/viewer/mujoco_viewer_debug.py
 GBC/viewer/mujoco_deploy_viewer.py
 GBC/controllers/*
+# Regression tests MUST be tracked — override the broad test*/*test* ignores
+# above (which otherwise drop the whole tests/ dir, so it was never versioned).
+!tests/
+!tests/*.py

@@ -1436,6 +1436,13 @@ class UnifiedLatentRetargeter(nn.Module):
                 dropout=dropout,
                 # E1: decoder temporal Conv1d becomes left-pad causal so the
                 # decoder cannot peek at future frames either.
+                # E1 forces the decoder Conv1d left-pad causal too. T-series
+                # (block_causal_compress) defaults FALSE here so the existing
+                # T4/T5 checkpoints (trained 2026-06-02 with symmetric padding)
+                # load and run with the SAME padding they were optimized for.
+                # NOTE: a fully streaming-causal T-series needs a retrain with
+                # this flag flipped to True — see [[project-nan-rootcause]]'s
+                # sibling streaming TODO. Adds ~±4 frames decoder lookahead now.
                 temporal_decoder_causal=(self.temporal_module == "causal_transformer"),
             )
         else:

@@ -2184,3 +2184,271 @@ def is_foot_parallel_from_rot_matrix(rot_mat_batch: torch.Tensor, tolerance_deg:
     is_parallel = torch.abs(dot_product) >= cos_tolerance
 
     return is_parallel
+
+
+# ---------------------------------------------------------------------------
+# Retargeting evaluation metrics
+# ---------------------------------------------------------------------------
+# Physical-quality + contact metrics for judging a retargeted robot motion the
+# way OmniRetarget (ICRA 2026) does: by PHYSICAL plausibility (smoothness,
+# foot-skating, ground penetration) and CONTACT preservation — NOT by distance
+# to a (possibly flawed) reference retarget such as GMR. GMR/PHC are baselines
+# OmniRetarget *beats*; their own eval (evaluate_penetration / detect_foot_
+# sliding / evaluate_contact_precision) carries no distance-to-baseline term.
+# Each function operates on a single trajectory (leading dim T = time).
+
+
+def _as_float_tensor(x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    return x.float()
+
+
+def motion_jerk(x: Union[torch.Tensor, np.ndarray], fps: float = 20.0) -> torch.Tensor:
+    """RMS jerk (3rd time derivative) — a smoothness metric, lower = smoother.
+
+    Args:
+        x: (T, D) joint angles, or (T, L, 3) link positions.
+        fps: frames per second (for the time scaling).
+
+    Returns:
+        Scalar tensor, units [x]/s^3. 0 for constant-velocity (perfectly smooth)
+        motion; large for jitter. Distinguishes our smooth model output from a
+        jerky GMR reference without ever comparing the two.
+    """
+    x = _as_float_tensor(x)
+    if x.shape[0] < 4:
+        return x.new_zeros(())
+    dt = 1.0 / float(fps)
+    jerk = torch.diff(x, n=3, dim=0) / (dt ** 3)
+    return jerk.pow(2).mean().sqrt()
+
+
+def foot_sticking_mask(source_toe_xy: Union[torch.Tensor, np.ndarray],
+                       vel_threshold: float = 0.01) -> torch.Tensor:
+    """MORPHOLOGY-AWARE stance mask — OmniRetarget's foot-sticking test
+    (extract_foot_sticking_sequence_velocity). A foot is in stance when the
+    per-frame HORIZONTAL displacement of the SOURCE (human) toe is small:
+
+        stance[t] = || source_toe_xy[t] - source_toe_xy[t-1] || <= vel_threshold
+
+    Compute this on the HUMAN SOURCE toe trajectory, then apply it to ANY robot.
+    The human defines WHEN a foot should be planted — a body-agnostic event — so
+    the SAME stance reference is comparable across G1 / H1-2 / GR3. This is why
+    it is morph-aware. Do NOT derive stance from robot foot HEIGHT (ground
+    offset / leg length differ per morphology — exactly the trap that makes
+    height-based stance wrong across embodiments) NOR from the robot's own
+    horizontal velocity (circular with the slip we want to measure).
+
+    Args:
+        source_toe_xy: (T, F, 2|3) SOURCE toe positions (only xy used).
+        vel_threshold: max per-frame xy displacement (m) to count as planted.
+
+    Returns: (T, F) bool. Frame 0 is never stance (no prior frame).
+    """
+    p = _as_float_tensor(source_toe_xy)[..., :2]
+    if p.shape[0] < 2:
+        return torch.ones(p.shape[:-1], dtype=torch.bool, device=p.device)
+    disp = torch.linalg.norm(p[1:] - p[:-1], dim=-1)                  # (T-1, F)
+    head = torch.full_like(disp[:1], vel_threshold + 1.0)            # frame 0 -> not stance
+    return torch.cat([head, disp], dim=0) <= vel_threshold
+
+
+def foot_slide_metric(
+    robot_foot_pos_w: Union[torch.Tensor, np.ndarray],
+    contact: Union[torch.Tensor, np.ndarray, None] = None,
+    source_toe_xy: Union[torch.Tensor, np.ndarray, None] = None,
+    fps: float = 20.0,
+    vel_threshold: float = 0.01,
+    speed_tol: float = 0.05,
+    length_scale: float = 1.0,
+) -> dict:
+    """Foot-skating: horizontal slip of the ROBOT foot while the SOURCE foot is
+    planted — OmniRetarget's foot-sliding metric (detect_foot_sliding).
+
+    Morph-aware by construction: stance comes from the human SOURCE (when the
+    foot SHOULD be planted), the slip is measured on the ROBOT (whether it
+    honors that). Same human stance reference ⇒ GR3 vs G1 foot-slide are
+    comparable. (Deriving stance from the robot's own height/velocity is either
+    morphology-dependent or circular — see foot_sticking_mask.)
+
+    length_scale: divide the ROBOT slip magnitudes by this (pass the robot's
+    standing height z_stand → mean_slip/max_slip become body-heights/s and
+    speed_tol is in body-heights/s). This is holosoma's ROBOT_HEIGHT
+    normalization (smpl_scale = ROBOT_HEIGHT/human_height): WITHOUT it, a small
+    robot's slip in absolute m/s is not comparable to a tall one's. The SOURCE
+    stance (vel_threshold on source_toe_xy) is in human metres and is NOT scaled
+    — stance is morphology-free by design. Default 1.0 = raw metres.
+
+    Args:
+        robot_foot_pos_w: (T, F, 3) WORLD robot foot/toe positions.
+        contact: (T, F) bool SOURCE stance mask. If None, computed from
+            source_toe_xy via foot_sticking_mask. One of the two is required.
+        source_toe_xy: (T, F, 2|3) SOURCE toe positions (used iff contact is None).
+        fps: frames per second. speed_tol: slip-speed threshold (length_scale/s).
+        vel_threshold: source foot-sticking threshold (human m/frame).
+
+    Returns dict of scalar tensors:
+        mean_slip — mean robot horizontal speed during source-stance (0 ideal),
+        max_slip  — worst stance slip speed,
+        slip_frac — fraction of source-stance frames slipping faster than speed_tol.
+    """
+    foot = _as_float_tensor(robot_foot_pos_w)
+    if foot.shape[0] < 2:
+        z = foot.new_zeros(())
+        return {"mean_slip": z, "max_slip": z, "slip_frac": z}
+    if contact is None:
+        if source_toe_xy is None:
+            raise ValueError(
+                "foot_slide_metric needs the SOURCE stance: pass `contact` (T,F) "
+                "or `source_toe_xy` (T,F,2|3). Robot-side height/velocity stance "
+                "is not morph-aware (foot_sticking_mask doc).")
+        contact = foot_sticking_mask(source_toe_xy, vel_threshold)
+    dt = 1.0 / float(fps)
+    # robot slip normalized by ROBOT_HEIGHT (length_scale) for cross-morph fairness
+    horiz_speed = torch.linalg.norm(torch.diff(foot[..., :2], dim=0), dim=-1) / dt / float(length_scale)  # (T-1, F)
+    st = _as_float_tensor(contact).bool()[1:]  # align to forward-difference frames
+    denom = st.sum().clamp_min(1)
+    mean_slip = (horiz_speed * st).sum() / denom
+    max_slip = horiz_speed[st].max() if bool(st.any()) else horiz_speed.new_zeros(())
+    slip_frac = ((horiz_speed > speed_tol) & st).sum() / denom
+    return {"mean_slip": mean_slip, "max_slip": max_slip, "slip_frac": slip_frac}
+
+
+def ground_penetration_metric(
+    link_pos_w: Union[torch.Tensor, np.ndarray],
+    ground_z: float = 0.0,
+    clearance: float = 0.0,
+    length_scale: float = 1.0,
+) -> dict:
+    """Ground penetration: how far links dip below the floor.
+
+    Args:
+        link_pos_w: (T, L, 3) WORLD link/surface-point positions. Pass the
+            LOWEST surface samples (e.g. foot soles) for a meaningful value.
+        ground_z: floor height (world z). clearance: per-point radius/offset
+            subtracted before the test (a point penetrates when
+            z - clearance < ground_z).
+        length_scale: divide depths by this (pass robot z_stand → depths become
+            fractions of body height, cross-morph comparable; holosoma's
+            ROBOT_HEIGHT normalization). Default 1.0 = raw metres.
+
+    Returns dict of scalar tensors:
+        mean_depth — mean penetration depth over all frames*links (ideal 0),
+        max_depth  — worst penetration depth,
+        pen_frac   — fraction of frames with ANY link penetrating.
+    """
+    link_pos_w = _as_float_tensor(link_pos_w)
+    depth = torch.relu(ground_z - (link_pos_w[..., 2] - clearance)) / float(length_scale)  # (T, L)
+    mean_depth = depth.mean() if depth.numel() else link_pos_w.new_zeros(())
+    max_depth = depth.max() if depth.numel() else link_pos_w.new_zeros(())
+    pen_frac = (depth.amax(dim=-1) > 1e-6).float().mean() if depth.numel() else link_pos_w.new_zeros(())
+    return {"mean_depth": mean_depth, "max_depth": max_depth, "pen_frac": pen_frac}
+
+
+def contact_preservation_metric(
+    human_contact: Union[torch.Tensor, np.ndarray],
+    robot_contact: Union[torch.Tensor, np.ndarray],
+) -> dict:
+    """Fraction of the human's contact events reproduced by the robot.
+
+    Args:
+        human_contact, robot_contact: (T, K) bool, SAME keypoint correspondence
+            (e.g. per-foot / per-hand contact over time).
+
+    Returns dict of scalar tensors:
+        preserved     — recall of human contacts kept by the robot (ideal 1),
+        false_contact — robot contacts where the human had none, normalized by
+                        robot contacts (ideal 0).
+    A good retarget keeps the human's contacts rather than dropping or
+    inventing them — OmniRetarget's contact-preservation criterion.
+    """
+    h = _as_float_tensor(human_contact).bool()
+    r = _as_float_tensor(robot_contact).bool()
+    preserved = (h & r).sum() / h.sum().clamp_min(1)
+    false_contact = (r & ~h).sum() / r.sum().clamp_min(1)
+    return {"preserved": preserved.float(), "false_contact": false_contact.float()}
+
+
+def center_of_mass(link_pos_w: Union[torch.Tensor, np.ndarray],
+                   link_mass: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+    """Mass-weighted whole-body centre of mass (rough, link-origin based).
+
+    CoM(t) = Σ_i m_i p_i(t) / Σ_i m_i, using each robot's OWN per-link masses
+    (from its URDF inertial) — so it is morphology-native. A *static* estimate:
+    it weights link ORIGINS and ignores the small within-link inertial offset
+    (enough for the contact-phase balance check; no dynamics / angular momentum).
+
+    Args:
+        link_pos_w: (T, L, 3) WORLD link positions.
+        link_mass: (L,) per-link masses (same link order).
+
+    Returns: (T, 3) CoM trajectory.
+    """
+    p = _as_float_tensor(link_pos_w)
+    m = _as_float_tensor(link_mass)
+    w = (m / m.sum().clamp_min(1e-9)).view(1, -1, 1)
+    return (p * w).sum(dim=1)
+
+
+def _point_segment_distance_2d(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Per-frame distance from point p to segment a-b, all (T, 2) -> (T,)."""
+    ab = b - a
+    t = ((p - a) * ab).sum(-1) / (ab * ab).sum(-1).clamp_min(1e-9)
+    proj = a + t.clamp(0.0, 1.0).unsqueeze(-1) * ab
+    return torch.linalg.norm(p - proj, dim=-1)
+
+
+def balance_support_metric(
+    com_xy: Union[torch.Tensor, np.ndarray],
+    foot_xy: Union[torch.Tensor, np.ndarray],
+    stance: Union[torch.Tensor, np.ndarray],
+    foot_radius: float = 0.08,
+    length_scale: float = 1.0,
+) -> dict:
+    """Static balance: is the CoM ground-projection over the support during the
+    CONTACT phase? Morphology-native (CoM from the robot's own masses, support
+    from its own planted feet). A kinematic retarget does not enforce dynamics,
+    so this scores dynamic PLAUSIBILITY in a body-fair way (GR3 vs G1 each judged
+    against its own support) — not pose similarity to the human.
+
+    Biped assumption: up to 2 support feet. Support region = the planted foot
+    point (single support) or the segment between both planted feet (double
+    support), expanded by `foot_radius` (Minkowski, a rough sole footprint).
+    Frames with no planted foot (flight) are excluded.
+
+    Args:
+        com_xy: (T, 2) CoM ground projection (xy). (T,3) also accepted.
+        foot_xy: (T, 2, 2|3) the two feet's world positions (only xy used).
+        stance: (T, 2) bool — which feet are planted (use the source-anchored
+            foot_sticking_mask: morphology-independent stance).
+        foot_radius: sole footprint radius (m) expanding the support region.
+
+    Returns dict of scalar tensors:
+        unstable_frac — fraction of CONTACT frames with CoM outside support
+                        (margin > 0; ideal small for a plausible retarget),
+        mean_margin   — mean signed CoM-to-support distance over contact frames
+                        (negative = inside support = balanced),
+        contact_frac  — fraction of frames with >=1 planted foot.
+    """
+    com = _as_float_tensor(com_xy)[..., :2]
+    feet = _as_float_tensor(foot_xy)[..., :2]          # (T, 2, 2)
+    st = _as_float_tensor(stance).bool()               # (T, 2)
+    nfeet = st.sum(dim=-1)                              # (T,)
+    d_both = _point_segment_distance_2d(com, feet[:, 0], feet[:, 1])
+    d0 = torch.linalg.norm(com - feet[:, 0], dim=-1)
+    d1 = torch.linalg.norm(com - feet[:, 1], dim=-1)
+    d_one = torch.where(st[:, 0], d0, d1)              # the single planted foot
+    dist = torch.where(nfeet >= 2, d_both, d_one)
+    # normalize margin by ROBOT_HEIGHT (length_scale) → body-height units, so the
+    # balance margin is comparable across morphologies (holosoma height ratio).
+    margin = (dist - float(foot_radius)) / float(length_scale)  # <0 inside support = stable
+    contact = nfeet >= 1
+    denom = contact.sum().clamp_min(1)
+    unstable_frac = ((margin > 0) & contact).sum() / denom
+    mean_margin = (margin * contact).sum() / denom
+    return {
+        "unstable_frac": unstable_frac.float(),
+        "mean_margin": mean_margin.float(),
+        "contact_frac": contact.float().mean(),
+    }

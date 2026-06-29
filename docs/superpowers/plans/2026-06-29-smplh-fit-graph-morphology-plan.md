@@ -215,7 +215,7 @@ PYTHONPATH=/cpfs/user/yaoyifei/codespace/gbc/GBC:/cpfs/user/yaoyifei/codespace/g
 
 Expected: exit 0 and help includes `--morph-fit-graph`.
 
-- [ ] **Step 3: Commit implementation**
+- [x] **Step 3: Commit implementation**
 
 ```bash
 git -C GBC add GBC/utils/data_preparation/morphology_conditioned_retargeter.py tests/test_smplh_fit_graph_morphology.py docs/superpowers/plans/2026-06-29-smplh-fit-graph-morphology-plan.md
@@ -224,7 +224,7 @@ git -C GBC_MUJICA add GBC_MUJICA/data_preparation/gbc_retargeting/train_graph_la
 git -C GBC_MUJICA commit -m "feat: wire SMPL-H fit graph morphology training"
 ```
 
-- [ ] **Step 4: Submit DLC**
+- [x] **Step 4: Submit DLC**
 
 Use the existing co-training submit pattern with these new flags:
 
@@ -236,3 +236,10 @@ Use the existing co-training submit pattern with these new flags:
 ```
 
 Record the DLC job id, save dir, and submit command in the final response.
+
+Submitted:
+
+- job id: `dlc1ayj4zuiba7ez`
+- job name: `gbc_cotrain_fitgraph_w60_b16_0629`
+- save dir: `/cpfs/user/yaoyifei/gbc_runs/cotrain_fitgraph_dlc_0629`
+- status at first poll: `EnvPreparing` / `JobPreparing`

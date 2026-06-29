@@ -242,4 +242,26 @@ Submitted:
 - job id: `dlc1ayj4zuiba7ez`
 - job name: `gbc_cotrain_fitgraph_w60_b16_0629`
 - save dir: `/cpfs/user/yaoyifei/gbc_runs/cotrain_fitgraph_dlc_0629`
+- final status: `Failed`
+- failure: old code path required SMPL-H fit graph fields for the unified human decoder's
+  internal SMPL-H reconstruction batch.
+
+Follow-up fix and offline eval:
+
+- GBC commit: `124992c fix: allow fit graph with unified human decoder`
+- GBC_MUJICA commit: `7a2aa4e fix: log fit graph reconstruction eval metrics`
+- local probe dir: `/cpfs/user/yaoyifei/gbc_runs/offline_fitgraph_recon_probe3_0629`
+- local eval dir: `/cpfs/user/yaoyifei/gbc_runs/offline_fitgraph_recon_eval_probe3_0629`
+- local eval result after 2 tiny epochs:
+  - G1 val mean L2 `0.11956`, human pose recon MSE `0.04236`, root-z loss `0.00959`,
+    root target source reference `1.0`, fit stand height mean `0.80177`.
+  - H1-2 val mean L2 `0.18711`, human pose recon MSE `0.04849`, root-z loss `0.04283`,
+    root target source reference `1.0`, fit stand height mean `0.80173`.
+
+Resubmitted fixed DLC:
+
+- job id: `dlc1r2nojutvbb0q`
+- job name: `gbc_cotrain_fitgraph_fixed_w60_b16_0629`
+- save dir: `/cpfs/user/yaoyifei/gbc_runs/cotrain_fitgraph_fixed_dlc_0629`
 - status at first poll: `EnvPreparing` / `JobPreparing`
+- additional flags: `--encoder-beta-source zero --root-z-target-source reference`

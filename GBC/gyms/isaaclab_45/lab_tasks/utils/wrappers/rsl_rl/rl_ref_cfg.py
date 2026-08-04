@@ -49,6 +49,15 @@ class RslRlRefPpoActorCriticCfg:
         'joint_decoder',
         'sonic_joint_decoder',
     ] = "gated"
+    critic_fusion_mode: Literal[
+        'gated',
+        'add',
+        'concat',
+        'attention',
+        'joint_decoder',
+        'sonic_joint_decoder',
+        'direct_concat',
+    ] | None = None
 
 @configclass
 class RslRlRefPpoAmpNetCfg:
@@ -84,6 +93,8 @@ class RslRlRefPpoAlgorithmCfg:
     lam: float = MISSING
     max_grad_norm: float = MISSING
     learning_rate: float = MISSING
+    actor_learning_rate: float | None = None
+    critic_learning_rate: float | None = None
     normalize_advantage_per_mini_batch: bool = False
     max_lr: float = 1e-2
     min_lr: float = 1e-4

@@ -39,6 +39,9 @@ class RslRlRefPpoActorCriticCfg:
     actor_hidden_dims: list[int] = MISSING
     critic_hidden_dims: list[int] = MISSING
     joint_decoder_hidden_dims: list[int] = []
+    reference_history_length: int | None = None
+    reference_encoder_output_dim: int | None = None
+    project_reference_features: bool = False
     activation: str = "elu"
     use_layer_norm: bool = False
     fusion_mode: Literal[

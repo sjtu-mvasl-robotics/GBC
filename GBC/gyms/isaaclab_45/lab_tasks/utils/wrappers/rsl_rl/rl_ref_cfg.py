@@ -15,6 +15,8 @@ class RslRlRefPpoActorCriticCfg:
     num_heads: int = MISSING
     num_steps_per_env: int = MISSING
     init_noise_std: float = MISSING
+    min_noise_std: float | None = None
+    max_noise_std: float | None = None
     max_seq_len: int = 24
     mlp_hidden_dims: list[int] = []
     
@@ -36,8 +38,17 @@ class RslRlRefPpoActorCriticCfg:
     # For MM-MLP
     actor_hidden_dims: list[int] = MISSING
     critic_hidden_dims: list[int] = MISSING
+    joint_decoder_hidden_dims: list[int] = []
     activation: str = "elu"
-    fusion_mode: Literal['gated', 'concat', 'attention'] = "gated"
+    use_layer_norm: bool = False
+    fusion_mode: Literal[
+        'gated',
+        'add',
+        'concat',
+        'attention',
+        'joint_decoder',
+        'sonic_joint_decoder',
+    ] = "gated"
 
 @configclass
 class RslRlRefPpoAmpNetCfg:

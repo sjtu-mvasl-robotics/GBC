@@ -33,8 +33,16 @@ class RslRlRefPpoActorCriticCfg:
     concatenate_ref_term_names: dict[str, list[list[str]]] | None = None
     pred_obs_term_names: list[str] | None = None
     pred_obs_term_weights: list[float] | None = None
+    # MMGPT-only self-supervision gradient routing.
+    aux_backbone_grad: bool = True
+    dreamer_gradient_mode: Literal[
+        "backbone_only",
+        "backbone_and_action_head",
+    ] = "backbone_only"
+    score_prediction_enabled: bool = False
     use_mlp_dagger: bool = False
     dagger_history_length: int = 1  # only used if use_mlp_dagger is True
+    critic_history_length: int = 1
     # For MM-MLP
     actor_hidden_dims: list[int] = MISSING
     critic_hidden_dims: list[int] = MISSING
@@ -126,6 +134,10 @@ class RslRlRefPpoAlgorithmCfg:
     teacher_lr: float = 5e-4
     teacher_only_interval: int = 0
     hybrid_training_intervals: int = 0
+    # MMGPT self-supervision scales.  Zero disables the contribution without
+    # changing the instantiated policy or prediction heads.
+    aux_loss_coef: float = 1.0
+    dreamer_loss_coef: float = 1.0
     rnd_cfg: dict | None = None
     symmetry_cfg: dict | None = None
     amp_cfg: RslRlPpoAmpCfg | None = None

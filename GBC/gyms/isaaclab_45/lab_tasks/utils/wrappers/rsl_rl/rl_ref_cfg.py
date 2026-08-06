@@ -38,7 +38,11 @@ class RslRlRefPpoActorCriticCfg:
     dreamer_gradient_mode: Literal[
         "backbone_only",
         "backbone_and_action_head",
+        "action_path_only",
     ] = "backbone_only"
+    dreamer_target_term_name: str = "target_actions"
+    dreamer_target_action_offset: int = 0
+    latest_reference_only: bool = False
     score_prediction_enabled: bool = False
     use_mlp_dagger: bool = False
     dagger_history_length: int = 1  # only used if use_mlp_dagger is True
@@ -68,6 +72,7 @@ class RslRlRefPpoActorCriticCfg:
         'joint_decoder',
         'sonic_joint_decoder',
         'direct_concat',
+        'direct_concat_ref_first',
     ] | None = None
 
 @configclass

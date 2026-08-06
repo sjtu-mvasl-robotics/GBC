@@ -106,6 +106,7 @@ class RslRlRefPpoAlgorithmCfg:
     learning_rate: float = MISSING
     actor_learning_rate: float | None = None
     critic_learning_rate: float | None = None
+    weight_decay: float = 1.0e-2
     normalize_advantage_per_mini_batch: bool = False
     max_lr: float = 1e-2
     min_lr: float = 1e-4

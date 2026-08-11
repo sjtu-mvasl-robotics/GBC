@@ -43,6 +43,9 @@ class RslRlRefPpoActorCriticCfg:
     dreamer_target_term_name: str = "target_actions"
     dreamer_target_action_offset: int = 0
     latest_reference_only: bool = False
+    streaming_kv_cache: bool = False
+    streaming_sequence_training: bool = False
+    streaming_context_steps: int | None = None
     score_prediction_enabled: bool = False
     use_mlp_dagger: bool = False
     dagger_history_length: int = 1  # only used if use_mlp_dagger is True

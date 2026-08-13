@@ -46,6 +46,9 @@ class RslRlRefPpoActorCriticCfg:
     streaming_kv_cache: bool = False
     streaming_sequence_training: bool = False
     streaming_context_steps: int | None = None
+    # Opt-in SONIC-rate temporal history compression.  One completed token is
+    # emitted for every K physical 50 Hz frames; K=1 preserves raw streaming.
+    temporal_chunk_size: int = 1
     score_prediction_enabled: bool = False
     use_mlp_dagger: bool = False
     dagger_history_length: int = 1  # only used if use_mlp_dagger is True

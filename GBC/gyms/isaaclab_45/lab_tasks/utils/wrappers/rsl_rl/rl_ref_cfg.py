@@ -49,6 +49,15 @@ class RslRlRefPpoActorCriticCfg:
     # Opt-in SONIC-rate temporal history compression.  One completed token is
     # emitted for every K physical 50 Hz frames; K=1 preserves raw streaming.
     temporal_chunk_size: int = 1
+    # Opt-in replacement for the legacy flatten-only chunk actor.  The slow
+    # Transformer proposes one persistent K-action plan and a current-frame MLP
+    # applies bounded feedback at the physical control rate.
+    temporal_fast_slow_enabled: bool = False
+    temporal_fast_residual_scale: float = 1.0
+    # Calibration-only in phase 1: instantiated and checkpointed, but no Q loss
+    # or actor gradient is wired until chunk-return validation passes.
+    chunk_q_enabled: bool = False
+    chunk_q_hidden_dims: list[int] | None = None
     score_prediction_enabled: bool = False
     use_mlp_dagger: bool = False
     dagger_history_length: int = 1  # only used if use_mlp_dagger is True

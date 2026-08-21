@@ -54,6 +54,15 @@ class RslRlRefPpoActorCriticCfg:
     # applies bounded feedback at the physical control rate.
     temporal_fast_slow_enabled: bool = False
     temporal_fast_residual_scale: float = 1.0
+    # Actor-only test-time-training memory. The fast weights are recurrent
+    # rollout state; these fields configure the meta-learned K/Q/V projections
+    # and normalized inner update, not an online optimizer over the backbone.
+    ttt_memory_enabled: bool = False
+    ttt_num_heads: int | None = None
+    ttt_inner_lr: float = 0.1
+    ttt_inner_lr_max: float = 1.0
+    ttt_gate_init: float = 1.0e-3
+    ttt_learnable_inner_lr: bool = True
     # Calibration-only in phase 1: instantiated and checkpointed, but no Q loss
     # or actor gradient is wired until chunk-return validation passes.
     chunk_q_enabled: bool = False

@@ -63,6 +63,9 @@ class RslRlRefPpoActorCriticCfg:
     ttt_inner_lr_max: float = 1.0
     ttt_gate_init: float = 1.0e-3
     ttt_learnable_inner_lr: bool = True
+    # Zero keeps episode-long fast memory. A positive value resets only the
+    # TTT fast weights every K physical policy steps; H10/KV remain continuous.
+    ttt_memory_horizon_steps: int = 0
     # Calibration-only in phase 1: instantiated and checkpointed, but no Q loss
     # or actor gradient is wired until chunk-return validation passes.
     chunk_q_enabled: bool = False

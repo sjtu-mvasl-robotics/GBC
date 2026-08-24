@@ -171,6 +171,17 @@ class RslRlRefPpoAlgorithmCfg:
     # changing the instantiated policy or prediction heads.
     aux_loss_coef: float = 1.0
     dreamer_loss_coef: float = 1.0
+    # Fixed-expert BC -> DAgger -> PPO schedule.  ``fixed_teacher_cfg=None``
+    # preserves the legacy behavior exactly.
+    fixed_teacher_cfg: dict | None = None
+    expert_bc_loss_coef: float = 0.0
+    expert_rl_bc_loss_coef: float = 0.0
+    expert_bc_loss_mode: Literal["mse", "huber"] = "mse"
+    expert_bc_only_iterations: int = 0
+    expert_dagger_plateau_iterations: list[int] | None = None
+    expert_dagger_student_probs: list[float] | None = None
+    expert_recovery_steps: int = 10
+    expert_require_critic_ready_for_rl: bool = True
     rnd_cfg: dict | None = None
     symmetry_cfg: dict | None = None
     amp_cfg: RslRlPpoAmpCfg | None = None

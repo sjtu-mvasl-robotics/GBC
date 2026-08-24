@@ -167,6 +167,10 @@ class RslRlRefPpoAlgorithmCfg:
     teacher_lr: float = 5e-4
     teacher_only_interval: int = 0
     hybrid_training_intervals: int = 0
+    # Critic objective while PPO is suppressed by a teacher/fixed-expert
+    # stage.  Zero is a hard freeze: MMPPO does not attach the value graph to
+    # the optimizer loss, so momentum/weight decay cannot move the critic.
+    teacher_value_loss_coef: float = 0.5
     # MMGPT self-supervision scales.  Zero disables the contribution without
     # changing the instantiated policy or prediction heads.
     aux_loss_coef: float = 1.0

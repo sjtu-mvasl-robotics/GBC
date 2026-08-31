@@ -175,6 +175,15 @@ class RslRlRefPpoAlgorithmCfg:
     # changing the instantiated policy or prediction heads.
     aux_loss_coef: float = 1.0
     dreamer_loss_coef: float = 1.0
+    # Optional MMGPT actor-gradient cap.  Each self-supervised objective is
+    # balanced independently against the PPO+BC actor gradient; predictor-head
+    # learning remains at the nominal auxiliary coefficient.
+    guidance_grad_norm_enabled: bool = False
+    guidance_grad_norm_target_ratio: float = 0.25
+    guidance_grad_norm_min_scale: float = 0.0
+    guidance_grad_norm_max_scale: float = 1.0
+    guidance_grad_norm_epsilon: float = 1.0e-8
+    guidance_grad_norm_update_interval: int = 20
     # Fixed-expert BC -> DAgger -> PPO schedule.  ``fixed_teacher_cfg=None``
     # preserves the legacy behavior exactly.
     fixed_teacher_cfg: dict | None = None
